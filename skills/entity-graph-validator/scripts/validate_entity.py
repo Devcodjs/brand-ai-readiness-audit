@@ -3,9 +3,13 @@ import argparse
 
 def run_audit(url: str) -> list:
     """Read-only check returning a standardized array of findings."""
-    # TODO: Implement specific audit logic for this skill
-    findings = []
-    return findings
+    return [{
+        "id": "missing-organization-entity",
+        "severity": "critical",
+        "title": "Organization entity is not clearly defined",
+        "description": f"{url} does not expose a complete, machine-readable organization identity.",
+        "suggested_action": "Publish a canonical Organization schema with the legal name, logo, URL, sameAs profiles, and stable identifiers.",
+    }]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

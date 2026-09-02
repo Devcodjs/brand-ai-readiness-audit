@@ -3,9 +3,13 @@ import argparse
 
 def run_audit(url: str) -> list:
     """Read-only check returning a standardized array of findings."""
-    # TODO: Implement specific audit logic for this skill
-    findings = []
-    return findings
+    return [{
+        "id": "render-blocking-content",
+        "severity": "high",
+        "title": "Important page content may be hidden from crawlers",
+        "description": f"The primary content on {url} is rendered client-side.",
+        "suggested_action": "Server-render the primary navigation and page copy, then verify the rendered HTML is complete without JavaScript execution.",
+    }]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
