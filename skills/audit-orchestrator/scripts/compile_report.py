@@ -6,20 +6,37 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-CHECKS = (
-    ("crawl-render-audit", "check_render.py"),
-    ("entity-graph-validator", "validate_entity.py"),
-    ("category-isolation-audit", "check_isolation.py"),
-    ("content-extractability-audit", "check_extractability.py"),
-    ("intent-continuity-audit", "check_intent.py"),
-    ("local-omnichannel-audit", "check_local.py"),
-)
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+MARKETPLACE_FILE = REPOSITORY_ROOT / "marketplace.json"
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
 
-def _run_check(check: tuple[str, str], url: str) -> list[dict]:
-    skill_name, script_name = check
-    script = Path(__file__).resolve().parents[3] / "skills" / skill_name / "scripts" / script_name
+def _load_checks() -> tuple[tuple[str, Path], ...]:
+    try:
+        marketplace = json.loads(MARKETPLACE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Unable to read {MARKETPLACE_FILE}: {error}") from error
+
+    checks = []
+    for skill in marketplace.get("skills", []):
+        if skill.get("entrypoint"):
+            continue
+        skill_name = skill.get("id")
+        skill_path = skill.get("path")
+        if not isinstance(skill_name, str) or not isinstance(skill_path, str):
+            raise RuntimeError("Each marketplace skill must define string 'id' and 'path' values")
+
+        scripts = sorted((REPOSITORY_ROOT / skill_path / "scripts").glob("*.py"))
+        if len(scripts) != 1:
+            raise RuntimeError(
+                f"Expected exactly one Python script for {skill_name}, found {len(scripts)}"
+            )
+        checks.append((skill_name, scripts[0]))
+    return tuple(checks)
+
+
+def _run_check(check: tuple[str, Path], url: str) -> list[dict]:
+    skill_name, script = check
     result = subprocess.run(
         [sys.executable, script, "--url", url],
         capture_output=True,
@@ -46,8 +63,9 @@ def _run_check(check: tuple[str, str], url: str) -> list[dict]:
 
 def orchestrate_audit(url: str) -> dict:
     """Run every audit check and return one deterministic, aggregated report."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(CHECKS)) as executor:
-        results = list(executor.map(lambda check: _run_check(check, url), CHECKS))
+    checks = _load_checks()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(checks)) as executor:
+        results = list(executor.map(lambda check: _run_check(check, url), checks))
 
     findings = [finding for result in results for finding in result]
     findings.sort(
