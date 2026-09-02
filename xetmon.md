@@ -1,1 +1,0 @@
-xetor moila juman
