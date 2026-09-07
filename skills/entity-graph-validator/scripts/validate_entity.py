@@ -7,13 +7,17 @@ def run_audit(url: str) -> list:
         "id": "missing-organization-entity",
         "severity": "critical",
         "title": "Organization entity is not clearly defined",
-        "description": f"{url} does not expose a complete, machine-readable organization identity.",
-        "suggested_action": "Publish a canonical Organization schema with the legal name, logo, URL, sameAs profiles, and stable identifiers.",
+        "evidence": f"{url} does not expose a complete, machine-readable organization identity.",
+        "suggested_action": {
+            "summary": "Publish a canonical Organization schema with the legal name, logo, URL, sameAs profiles, and stable identifiers.",
+            "priority": "high"
+        },
     }]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True, help="Target URL to audit")
+    parser.add_argument("--cache-dir", required=True, help="Cache directory")
     args = parser.parse_args()
     
     # Scripts must print JSON array to stdout for the Orchestrator to consume
