@@ -1,3 +1,2 @@
-# This project uses only Python's standard library till now.
-# No third-party packages are required yet.
-bs4
+requests
+beautifulsoup4

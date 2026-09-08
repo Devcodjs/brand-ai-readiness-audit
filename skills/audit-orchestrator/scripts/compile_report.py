@@ -1,17 +1,29 @@
-import json
 import argparse
 import concurrent.futures
+import json
+import socket
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
+
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# Local import of crawler module
-from crawler import SiteCrawler, RobotsBlockedException
+from crawler import SiteCrawler
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+def find_repository_root() -> Path:
+    """Find the marketplace root without relying on a fixed directory depth."""
+    here = Path(__file__).resolve()
+    for candidate in [here.parent, *here.parents]:
+        if (candidate / "marketplace.json").exists() and (candidate / "skills").exists():
+            return candidate
+    return here.parents[3]
+
+
+REPOSITORY_ROOT = find_repository_root()
 MARKETPLACE_FILE = REPOSITORY_ROOT / "marketplace.json"
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
@@ -21,32 +33,40 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
-REQUEST_TIMEOUT = 10
+
+ALWAYS_SAFE_SKILLS = {
+    "network-accessibility-audit",
+    "feed-syndication-audit",
+    "crawl-render-audit",
+}
+
+PAGE_DEPENDENT_SKILLS = {
+    "entity-graph-validator",
+    "category-isolation-audit",
+    "content-extractability-audit",
+    "intent-continuity-audit",
+    "local-omnichannel-audit",
+}
 
 
 def resolve_https_target(raw_input: str) -> str:
-    """
-    Normalizes domain or URL inputs, tests https://www.<domain> first,
-    falls back to https://<domain>, and raises ValueError if neither connects over HTTPS.
-    """
+    """Resolve a usable HTTPS target; reachable is not the same as auditable."""
     cleaned = raw_input.strip()
-
-    # Normalize missing scheme so urlparse extracts netloc correctly
+    if not cleaned:
+        raise ValueError("Target URL is empty.")
     if "://" not in cleaned:
         cleaned = f"https://{cleaned}"
 
     parsed = urlparse(cleaned)
     host = parsed.netloc or parsed.path.split("/")[0]
-    host = host.split(":")[0]  # Strip any port
+    host = host.split(":")[0]
+    if not host:
+        raise ValueError(f"Invalid target '{raw_input}': no hostname found.")
 
-    # Base domain without leading 'www.'
     base_domain = host[4:] if host.startswith("www.") else host
-
-    # Preserve any subpath and query parameters
-    subpath = parsed.path if parsed.netloc else ("/" + "/".join(parsed.path.split("/")[1:]) if "/" in parsed.path else "")
+    subpath = parsed.path if parsed.netloc else ""
     if parsed.query:
         subpath += f"?{parsed.query}"
 
@@ -54,29 +74,46 @@ def resolve_https_target(raw_input: str) -> str:
         f"https://www.{base_domain}{subpath}",
         f"https://{base_domain}{subpath}",
     ]
+    session = requests.Session()
+    session.mount(
+        "https://",
+        HTTPAdapter(max_retries=Retry(
+            total=2,
+            backoff_factor=0.5,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )),
+    )
 
-    last_error = "Unknown error"
-
-    for candidate in candidates:
+    last_error = "Unknown connection failure."
+    for candidate in dict.fromkeys(candidates):
         try:
-            resp = requests.get(
-                candidate,
-                headers=HEADERS,
-                timeout=REQUEST_TIMEOUT,
-                allow_redirects=True,
-            )
-            # Accept if it reached an active HTTPS server (including 403/503 bot challenges)
-            if resp.url.startswith("https://") and resp.status_code not in (404, 410, 502):
+            resp = session.get(candidate, headers=HEADERS, timeout=15, allow_redirects=True)
+            if resp.url.startswith("https://") and resp.status_code not in (404, 410):
                 return resp.url
-
-            last_error = f"HTTP status {resp.status_code}"
-        except requests.RequestException as exc:
-            last_error = str(exc)
-            continue
+            last_error = f"HTTP {resp.status_code} response received."
+        except requests.exceptions.SSLError:
+            last_error = "TLS/SSL certificate validation failed."
+        except requests.exceptions.ConnectTimeout:
+            last_error = "Connection attempt timed out."
+        except requests.exceptions.ReadTimeout:
+            last_error = "Server response timed out (possible WAF/rate limiting)."
+        except requests.exceptions.ConnectionError as exc:
+            cause = exc.__cause__ or exc.__context__
+            text = str(exc).lower()
+            if isinstance(cause, socket.gaierror) or "name or service not known" in text:
+                last_error = "DNS resolution failed."
+            elif isinstance(cause, ConnectionRefusedError) or "connection refused" in text:
+                last_error = "Remote host refused the connection."
+            elif isinstance(cause, TimeoutError) or "timed out" in text:
+                last_error = "Connection timed out."
+            else:
+                last_error = f"Connection error: {exc}"
+        except requests.exceptions.RequestException as exc:
+            last_error = f"Network exception: {exc}"
 
     raise ValueError(
-        f"Target '{raw_input}' could not be reached via HTTPS on either "
-        f"https://www.{base_domain} or https://{base_domain}. Reason: {last_error}"
+        f"Target '{raw_input}' could not be reached via HTTPS on {base_domain}: {last_error}"
     )
 
 
@@ -87,13 +124,15 @@ def _load_checks() -> tuple[tuple[str, Path], ...]:
         raise RuntimeError(f"Unable to read {MARKETPLACE_FILE}: {error}") from error
 
     checks = []
+    entrypoints = 0
     for skill in marketplace.get("skills", []):
         if skill.get("entrypoint"):
+            entrypoints += 1
             continue
         skill_name = skill.get("id")
         skill_path = skill.get("path")
         if not isinstance(skill_name, str) or not isinstance(skill_path, str):
-            raise RuntimeError("Each marketplace skill must define string 'id' and 'path' values")
+            raise RuntimeError("Each marketplace skill must define 'id' and 'path' strings")
 
         scripts = sorted((REPOSITORY_ROOT / skill_path / "scripts").glob("*.py"))
         if len(scripts) != 1:
@@ -101,6 +140,9 @@ def _load_checks() -> tuple[tuple[str, Path], ...]:
                 f"Expected exactly one Python script for {skill_name}, found {len(scripts)}"
             )
         checks.append((skill_name, scripts[0]))
+
+    if entrypoints != 1:
+        raise RuntimeError(f"Marketplace must declare exactly one entrypoint; found {entrypoints}")
     return tuple(checks)
 
 
@@ -112,100 +154,216 @@ def _run_check(check: tuple[str, Path], url: str, cache_dir: str) -> list[dict]:
         text=True,
         check=False,
     )
-    if result.returncode:
+    if result.returncode != 0:
         return [{
             "id": f"SYS-ERR-{skill_name[:4].upper()}",
             "title": f"Skill Execution Failed: {skill_name}",
             "severity": "medium",
             "evidence": result.stderr.strip() or f"Exited with code {result.returncode}",
             "suggested_action": {
-                "summary": "Check sub-skill dependencies and syntax.",
+                "summary": "Check sub-skill script dependencies, syntax, or arguments.",
                 "priority": "low",
             },
+            "skill": skill_name,
         }]
+
     try:
         findings = json.loads(result.stdout)
     except json.JSONDecodeError:
         return []
-
     if not isinstance(findings, list):
         return []
 
     for finding in findings:
         if isinstance(finding, dict):
             finding.setdefault("skill", skill_name)
-    return findings
+    return [f for f in findings if isinstance(f, dict)]
+
+
+def _load_cache_manifest(cache_dir: str) -> dict:
+    path = Path(cache_dir) / "cache_index.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _eligible_skills(checks, meta: dict) -> tuple[list[tuple[str, Path]], list[dict]]:
+    usable_ratio = float(meta.get("usable_page_ratio", 0.0) or 0.0)
+    usable_pages = int(meta.get("pages_usable", 0) or 0)
+    challenge_pages = int(meta.get("pages_challenge", 0) or 0)
+
+    evidence_notes = []
+    if challenge_pages:
+        evidence_notes.append({
+            "id": "CRAWL-DATA-QUALITY",
+            "title": "Crawl Evidence Quality Reduced by Challenge Responses",
+            "severity": "medium" if usable_pages else "high",
+            "evidence": (
+                f"{challenge_pages} sampled pages were classified as bot challenges; "
+                f"{usable_pages} pages were classified as normal HTML pages "
+                f"(usable-page ratio {usable_ratio:.0%})."
+            ),
+            "suggested_action": {
+                "summary": "Treat challenge/interstitial responses as unavailable evidence and improve crawlable access for representative public pages.",
+                "priority": "high" if not usable_pages else "medium",
+            },
+            "skill": "audit-orchestrator",
+        })
+
+    if usable_pages == 0 or usable_ratio < 0.40:
+        selected = [c for c in checks if c[0] in ALWAYS_SAFE_SKILLS]
+        evidence_notes.append({
+            "id": "CRAWL-SUPPRESS-001",
+            "title": "Page-Level Audits Suppressed Due to Insufficient Evidence",
+            "severity": "medium",
+            "evidence": (
+                f"Only {usable_pages} of {meta.get('pages_requested', 0)} sampled pages were normal HTML; "
+                "page-dependent checks were suppressed to avoid false positives."
+            ),
+            "suggested_action": {
+                "summary": "Restore access to representative normal pages before drawing conclusions about metadata, schema, breadcrumbs, category structure, or on-page engagement.",
+                "priority": "high",
+            },
+            "skill": "audit-orchestrator",
+        })
+        return selected, evidence_notes
+
+    # Moderate partial coverage: allow all checks, but their evidence can be qualified in the report.
+    return list(checks), evidence_notes
+
+
+def _dedupe_findings(findings: list[dict]) -> list[dict]:
+    seen = set()
+    result = []
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        title = str(finding.get("title", ""))
+        evidence = str(finding.get("evidence", ""))
+        key = (fid, title, evidence[:300])
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(finding)
+    return result
+
 
 def orchestrate_audit(raw_url: str) -> dict:
+    audited_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     try:
         resolved_url = resolve_https_target(raw_url)
     except ValueError as err:
         return {
             "site": raw_url,
-            "status": "aborted",
-            "audited_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "error": str(err),
-            "summary": {"total_findings": 0, "critical": 0, "high": 0, "medium": 0},
-            "findings": [],
+            "audited_at": audited_at,
+            "audit_confidence": {"execution": "HIGH", "evidence": "LOW"},
+            "summary": {"total_findings": 1, "critical": 0, "high": 0, "medium": 1, "low": 0, "info": 0},
+            "findings": [{
+                "id": "NET-PIPELINE-FAIL",
+                "skill": "audit-orchestrator",
+                "title": "Network Pipeline Resolution Failed",
+                "severity": "medium",
+                "evidence": str(err),
+                "suggested_action": {
+                    "summary": "Verify DNS resolution and HTTPS availability before evaluating the site's AI discoverability.",
+                    "priority": "medium",
+                },
+            }],
         }
 
-    # Execute crawler with robots enforcement
     try:
         crawler = SiteCrawler(resolved_url)
         cache_dir = crawler.build_cache()
-    except RobotsBlockedException as err:
-        return {
-            "site": resolved_url,
-            "original_input": raw_url,
-            "status": "blocked_by_robots",
-            "audited_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "summary": {"total_findings": 1, "critical": 1, "high": 0, "medium": 0},
-            "findings": [{
-                "id": "AI-READINESS-ROBOTS-DISALLOWED",
-                "skill": "crawler",
-                "title": "Site Disallows Automated Crawlers via robots.txt",
-                "severity": "critical",
-                "evidence": str(err),
-                "suggested_action": {
-                    "summary": "Update robots.txt to explicitly permit AI/audit bots if discoverability is desired.",
-                    "priority": "high"
-                }
-            }],
-        }
     except Exception as err:
         return {
             "site": resolved_url,
-            "status": "crawler_failed",
-            "audited_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "error": f"Crawler failed during cache execution: {err}",
-            "summary": {"total_findings": 0, "critical": 0, "high": 0, "medium": 0},
-            "findings": [],
+            "audited_at": audited_at,
+            "audit_confidence": {"execution": "LOW", "evidence": "LOW"},
+            "summary": {"total_findings": 1, "critical": 1, "high": 0, "medium": 0, "low": 0, "info": 0},
+            "findings": [{
+                "id": "SYS-CRAWLER-CRASH",
+                "skill": "audit-orchestrator",
+                "title": "Local Crawler Initialization Failed",
+                "severity": "critical",
+                "evidence": f"Crawler execution halted unexpectedly: {err}",
+                "suggested_action": {
+                    "summary": "Review the local crawler runtime, filesystem permissions, and network interface restrictions.",
+                    "priority": "critical",
+                },
+            }],
         }
 
-    # Phase 2: Run sub-skills concurrently against local cache
+    manifest = _load_cache_manifest(cache_dir)
+    meta = manifest.get("meta", {})
+    crawl_status = meta.get("crawl_status", "unknown")
+
     checks = _load_checks()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(checks) or 1) as executor:
-        results = list(executor.map(lambda check: _run_check(check, resolved_url, cache_dir), checks))
+    checks, evidence_notes = _eligible_skills(checks, meta)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(6, len(checks)))) as executor:
+        results = list(executor.map(
+            lambda check: _run_check(check, resolved_url, cache_dir),
+            checks,
+        ))
 
     findings = [finding for result in results for finding in result]
-    findings.sort(
-        key=lambda finding: (
-            SEVERITY_ORDER.get(str(finding.get("severity", "")).lower(), 99),
-            str(finding.get("id", "")),
-        )
-    )
+    findings.extend(evidence_notes)
+    findings = _dedupe_findings(findings)
+
+    findings.sort(key=lambda f: (
+        SEVERITY_ORDER.get(str(f.get("severity", "")).lower(), 99),
+        str(f.get("id", "")),
+    ))
+
+    usable = int(meta.get("pages_usable", 0) or 0)
+    requested = int(meta.get("pages_requested", 0) or 0)
+    challenge = int(meta.get("pages_challenge", 0) or 0)
+    ratio = usable / max(1, requested)
+
+    if usable >= 6 and ratio >= 0.70 and challenge == 0:
+        evidence_level = "HIGH"
+    elif usable >= 3 and ratio >= 0.40:
+        evidence_level = "MEDIUM"
+    else:
+        evidence_level = "LOW"
+
+    if crawl_status in {"blocked_by_waf", "rate_limited", "failed_root_fetch"} and usable == 0:
+        evidence_level = "LOW"
+    if crawl_status == "blocked_by_robots" and usable > 0:
+        evidence_level = "MEDIUM"
+
+    confidence = {
+        "execution": "HIGH",
+        "evidence": evidence_level,
+    }
+
+    summary = {
+        "total_findings": len(findings),
+        "critical": sum(str(f.get("severity", "")).lower() == "critical" for f in findings),
+        "high": sum(str(f.get("severity", "")).lower() == "high" for f in findings),
+        "medium": sum(str(f.get("severity", "")).lower() == "medium" for f in findings),
+        "low": sum(str(f.get("severity", "")).lower() == "low" for f in findings),
+        "info": sum(str(f.get("severity", "")).lower() == "info" for f in findings),
+    }
 
     return {
         "site": resolved_url,
-        "original_input": raw_url,
-        "status": "completed",
-        "audited_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "summary": {
-            "total_findings": len(findings),
-            "critical": sum(str(f.get("severity", "")).lower() == "critical" for f in findings),
-            "high": sum(str(f.get("severity", "")).lower() == "high" for f in findings),
-            "medium": sum(str(f.get("severity", "")).lower() == "medium" for f in findings),
+        "audited_at": audited_at,
+        "audit_confidence": confidence,
+        "crawl_summary": {
+            "status": crawl_status,
+            "pages_requested": requested,
+            "pages_usable": usable,
+            "pages_challenge": challenge,
+            "usable_page_ratio": round(ratio, 3),
+            "page_type_counts": meta.get("page_type_counts", {}),
+            "pages_by_classification": meta.get("pages_by_classification", {}),
+            "sitemap_present": bool(meta.get("sitemap_present")),
+            "robots_present": bool(meta.get("robots_present")),
+            "blocked_search_bots": meta.get("blocked_search_bots", []),
         },
+        "summary": summary,
         "findings": findings,
     }
 
@@ -214,4 +372,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True, help="Target URL or domain to audit")
     args = parser.parse_args()
+    sys.stdout.reconfigure(encoding="utf-8")
     print(json.dumps(orchestrate_audit(args.url), indent=2))
