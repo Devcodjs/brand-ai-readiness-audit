@@ -1,5 +1,5 @@
-# Entity Graph Validation Rules
+# Entity Graph Schema Rules
 
-1. **Organization Schema:** The target URL must contain a valid `Organization`, `Brand`, `Corporation`, or `LocalBusiness` JSON-LD block.
-2. **Entity Authority (sameAs):** The schema must contain a `sameAs` array referencing at least two external knowledge base URIs (e.g., Wikidata, Crunchbase, official social profiles).
-3. **Temporal Freshness:** Product or Article entities must declare `dateModified` timestamps to prevent stale AI factual citations.
+1. **Organization Definition:** Every site must expose an `@type`: `Organization` or `Brand` in JSON-LD.
+2. **Authority Linking:** Must supply `sameAs` arrays with at least 2 external links (Wikidata, Crunchbase, official social platforms).
+3. **Data Completeness:** Must include `name`, `url`, and `logo` properties within the central node.

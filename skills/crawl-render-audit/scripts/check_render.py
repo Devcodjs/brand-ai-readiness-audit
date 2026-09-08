@@ -1,49 +1,78 @@
 import sys
 import json
 import argparse
+import os
 import urllib.robotparser
 import requests
 from bs4 import BeautifulSoup
 
 AI_BOTS = ["GPTBot", "ClaudeBot", "PerplexityBot", "Google-Extended"]
 
-def audit_crawl_and_syndication(target_url: str) -> list:
+def audit_crawl_and_syndication(target_url: str, cache_dir: str = "audit-cache") -> list:
     findings = []
     domain = "/".join(target_url.split("/")[:3])
     
-    # 1. Check robots.txt for AI Crawler Directives
+    # 1. Check robots.txt (Local Cache First, Fallback to Live Network)
     is_ai_bot_blocked = False
     blocked_bots = []
     rp = urllib.robotparser.RobotFileParser()
-    rp.set_url(f"{domain}/robots.txt")
-    try:
-        rp.read()
-        for bot in AI_BOTS:
-            if not rp.can_fetch(bot, target_url):
-                blocked_bots.append(bot)
-        if blocked_bots:
-            is_ai_bot_blocked = True
-    except Exception:
-        pass # Handle missing or unparseable robots.txt gracefully
+    
+    cached_robots = os.path.join(cache_dir, "robots.txt")
+    if os.path.exists(cached_robots):
+        try:
+            with open(cached_robots, "r", encoding="utf-8") as f:
+                rp.parse(f.readlines())
+        except Exception:
+            pass
+    else:
+        try:
+            rp.set_url(f"{domain}/robots.txt")
+            rp.read()
+        except Exception:
+            pass # Handle missing or unparseable robots.txt gracefully
 
-    # 2. Inspect Raw HTML for Feed Syndication Pipelines
+    for bot in AI_BOTS:
+        if not rp.can_fetch(bot, target_url):
+            blocked_bots.append(bot)
+            
+    if blocked_bots:
+        is_ai_bot_blocked = True
+
+    # 2. Inspect Raw HTML for Feed Syndication (Local Cache First, Fallback to Live Network)
     has_merchant_feeds = False
     feed_types_found = []
-    try:
-        resp = requests.get(target_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        soup = BeautifulSoup(resp.text, "html.parser")
+    html_content = ""
+    
+    cached_html = os.path.join(cache_dir, "index.html")
+    if os.path.exists(cached_html):
+        try:
+            with open(cached_html, "r", encoding="utf-8") as f:
+                html_content = f.read()
+        except Exception:
+            pass
+    else:
+        try:
+            resp = requests.get(target_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            html_content = resp.text
+        except Exception:
+            pass
+
+    if html_content:
+        soup = BeautifulSoup(html_content, "html.parser")
         
         # Search for RSS, Atom, and OpenSearch tags in <head>
         feed_tags = soup.find_all("link", attrs={
-            "type": ["application/rss+xml", "application/atom+xml", "application/opensearchdescription+xml"]
+            "type": [
+                "application/rss+xml", 
+                "application/atom+xml", 
+                "application/opensearchdescription+xml"
+            ]
         })
         if feed_tags:
             has_merchant_feeds = True
-            feed_types_found = [tag.get("type") for tag in feed_tags]
-    except Exception:
-        pass
+            feed_types_found = list({tag.get("type") for tag in feed_tags if tag.get("type")})
 
-    # 3. Apply Conditional Diagnostic Logic (The Amazon Solution)
+    # 3. Apply Conditional Diagnostic Logic (Solving the "Amazon Problem")
     if is_ai_bot_blocked and not has_merchant_feeds:
         findings.append({
             "id": "DISC-CRIT-001",
@@ -80,7 +109,8 @@ def audit_crawl_and_syndication(target_url: str) -> list:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
+    parser.add_argument("--cache-dir", default="audit-cache")
     args = parser.parse_args()
     
-    results = audit_crawl_and_syndication(args.url)
+    results = audit_crawl_and_syndication(args.url, cache_dir=args.cache_dir)
     print(json.dumps(results, indent=2))
