@@ -36,6 +36,10 @@
     {
       "id": "local-omnichannel-audit",
       "path": "skills/local-omnichannel-audit"
+    },
+    {
+      "id": "content-freshness-audit",
+      "path": "skills/content-freshness-audit"
     }
   ]
 }

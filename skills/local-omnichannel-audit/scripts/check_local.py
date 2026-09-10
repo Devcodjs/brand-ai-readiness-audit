@@ -22,7 +22,12 @@ def load_cached_pages(cache_dir):
             try:
                 html = Path(page["file"]).read_text(encoding="utf-8", errors="replace")
                 soup = BeautifulSoup(html, "html.parser")
-                pages.append({"url": page["url"], "html": html, "soup": soup})
+                pages.append({
+                    "url": page["url"], 
+                    "html": html, 
+                    "soup": soup,
+                    "content_classification": page.get("content_classification")
+                })
             except Exception:
                 continue
     return pages
@@ -90,14 +95,71 @@ def extract_text(element):
 
 def run_checks(pages):
     findings = []
+    usable_pages = [p for p in pages if p.get("content_classification") == "normal"]
+
+    if not usable_pages:
+        return findings
+
+    # --- 1. GATE CHECK: Does this brand have a physical footprint? ---
+    physical_signals = []
+    retail_terms = [
+        "store locator", "find a store", "our stores", "our locations", 
+        "visit us", "find us", "where to buy", "retailers", "stockists", "locations"
+    ]
+    locator_classes = [
+        "store-locator", "find-a-store", "location-finder", "store-finder", 
+        "locations-list", "branch-locator", "dealer-locator"
+    ]
     
+    for page in usable_pages:
+        soup = page["soup"]
+        
+        # Check Schema for Physical Addresses or Local Entities
+        json_lds = extract_json_ld(soup)
+        for schema in json_lds:
+            if not isinstance(schema, dict): continue
+            if is_local_business(schema.get("@type")):
+                physical_signals.append("LocalBusiness Schema")
+            if find_postal_address(schema):
+                physical_signals.append("PostalAddress Schema")
+        
+        # Check for Maps
+        for iframe in soup.find_all("iframe"):
+            src = iframe.get("src", "").lower()
+            if any(m in src for m in ["google.com/maps", "maps.google", "mapbox", "openstreetmap"]):
+                physical_signals.append("Embedded Map")
+                
+        # Check for DOM Locator Widgets
+        for cls in locator_classes:
+            if soup.find(attrs={"class": lambda c: c and cls in c.lower()}) or soup.find(attrs={"id": lambda i: i and cls in i.lower()}):
+                physical_signals.append("Store Locator Widget")
+                
+        # Check Navigation/Links for Retail Phrasing
+        for a in soup.find_all("a", href=True):
+            a_text = a.get_text(separator=" ", strip=True).lower()
+            href = a["href"].lower()
+            if any(term in a_text for term in retail_terms) or any(term.replace(" ", "-") in href for term in retail_terms):
+                physical_signals.append("Retail Navigation Links")
+
+    physical_signals = list(set(physical_signals))
+
+    # Graceful exit for pure digital brands
+    if not physical_signals:
+        return [{
+            "id": "LOA-PASS-000",
+            "title": "Digital-First Brand Detected (Omnichannel Skipped)",
+            "severity": "info",
+            "evidence": "No physical retail signals (e.g., PostalAddress schema, map embeds, 'store locator' links) were detected across sampled pages. Assuming pure e-commerce or digital footprint; local omnichannel SEO audits bypassed to prevent false positives.",
+            "suggested_action": None
+        }]
+
     has_local_business_schema = False
     postal_address_findings = []
     geo_missing_pages = []
     hours_missing_pages = []
     has_local_business_anywhere = False
 
-    for page in pages:
+    for page in usable_pages:
         json_lds = extract_json_ld(page["soup"])
         page_has_lb = False
         
@@ -148,9 +210,9 @@ def run_checks(pages):
         if not has_local_business_schema:
             findings.append({
                 "id": "LOA-001",
-                "title": "Missing LocalBusiness Schema",
+                "title": "Missing LocalBusiness Schema on Physical Brand",
                 "severity": "high",
-                "evidence": f"Scanned {len(pages)} pages: 0/{len(pages)} contain LocalBusiness, Store, or related schema.org structured data. AI assistants cannot confirm this is a physical business or surface store details.",
+                "evidence": f"Physical footprint signals detected ({', '.join(physical_signals)}), but 0/{len(pages)} sampled pages contain LocalBusiness, Store, or related structured data. AI assistants cannot programmatically surface store details.",
                 "suggested_action": {
                     "summary": "Add JSON-LD structured data with the appropriate LocalBusiness subtype to the homepage and location pages. Include name, address, telephone, and openingHours at minimum.",
                     "priority": "high"
@@ -217,7 +279,7 @@ def run_checks(pages):
         ]
         
         map_without_address = []
-        for page in pages:
+        for page in usable_pages:
             soup = page["soup"]
             has_map = False
             for iframe in soup.find_all("iframe"):
@@ -231,7 +293,6 @@ def run_checks(pages):
                     break
             
             if has_map:
-                # check address
                 has_address = False
                 if soup.find("address"):
                     has_address = True
@@ -262,7 +323,7 @@ def run_checks(pages):
     try:
         phone_pattern = re.compile(r'[\+]?[\d][\d\s\-\.\(\)]{6,}[\d]')
         page_phones = {}
-        for page in pages:
+        for page in usable_pages:
             text = extract_text(page["soup"])
             phones = phone_pattern.findall(text)
             norm_phones = set()
@@ -271,7 +332,7 @@ def run_checks(pages):
                 if len(norm) >= 7:
                     norm_phones.add(norm)
             if norm_phones:
-                page_phones[page["url"]] = list(norm_phones)[0] # Just take one to compare
+                page_phones[page["url"]] = list(norm_phones)[0]
 
         if len(page_phones) > 1:
             urls = list(page_phones.keys())
@@ -301,10 +362,10 @@ def run_checks(pages):
 
     # LOA-007
     try:
-        contact_terms = ["contact", "location", "store", "stores", "find-us", "directions", "visit", "visit-us", "where", "branches", "our-stores", "find-a-store", "locations", "outlets"]
+        contact_terms = ["location", "store", "stores", "find-us", "directions", "visit", "visit-us", "where", "branches", "our-stores", "find-a-store", "locations", "outlets"]
         has_contact_page = False
         
-        for page in pages:
+        for page in usable_pages:
             url_lower = page["url"].lower()
             if any(term in url_lower for term in contact_terms):
                 has_contact_page = True
@@ -336,11 +397,11 @@ def run_checks(pages):
         if not has_contact_page:
             findings.append({
                 "id": "LOA-007",
-                "title": "No Contact or Location Page",
+                "title": "No Omnichannel Location Page",
                 "severity": "high",
-                "evidence": f"Scanned {len(pages)} pages and internal links: no dedicated contact or location page found.",
+                "evidence": f"Physical brand footprint detected ({', '.join(physical_signals)}), but scanned {len(pages)} pages/links and found no dedicated location page.",
                 "suggested_action": {
-                    "summary": "Create a dedicated /contact or /locations page with NAP, hours, map, and contact form. Link prominently from site navigation.",
+                    "summary": "Create a dedicated /locations page with NAP, hours, and map. Link prominently from site navigation.",
                     "priority": "high"
                 }
             })
@@ -356,7 +417,7 @@ def run_checks(pages):
         ]
         
         js_locked = None
-        for page in pages:
+        for page in usable_pages:
             for cls in locator_classes:
                 elements = page["soup"].find_all(attrs={"class": lambda c: c and cls in c.lower()})
                 elements.extend(page["soup"].find_all(attrs={"id": lambda i: i and cls in i.lower()}))
@@ -388,6 +449,16 @@ def run_checks(pages):
             })
     except Exception as e:
         sys.stderr.write(f"Error in LOA-008: {e}\n")
+
+    # If the brand is physical and passed all tests, explicitly say so rather than returning nothing.
+    if not findings:
+        findings.append({
+            "id": "LOA-PASS-001",
+            "title": "Omnichannel Discoverability Verified",
+            "severity": "info",
+            "evidence": f"Physical footprint signals detected ({', '.join(physical_signals)}). No major omnichannel schema, NAP inconsistency, or locator discoverability issues were observed.",
+            "suggested_action": None
+        })
 
     return findings
 

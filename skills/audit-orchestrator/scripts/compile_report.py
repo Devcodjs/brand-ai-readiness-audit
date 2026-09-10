@@ -48,6 +48,7 @@ PAGE_DEPENDENT_SKILLS = {
     "content-extractability-audit",
     "intent-continuity-audit",
     "local-omnichannel-audit",
+    "content-freshness-audit"
 }
 
 
@@ -270,6 +271,7 @@ def orchestrate_audit(raw_url: str) -> dict:
                     "priority": "medium",
                 },
             }],
+            "audit_notes": []
         }
 
     try:
@@ -292,6 +294,7 @@ def orchestrate_audit(raw_url: str) -> dict:
                     "priority": "critical",
                 },
             }],
+            "audit_notes": []
         }
 
     manifest = _load_cache_manifest(cache_dir)
@@ -307,15 +310,28 @@ def orchestrate_audit(raw_url: str) -> dict:
             checks,
         ))
 
-    findings = [finding for result in results for finding in result]
-    findings.extend(evidence_notes)
-    findings = _dedupe_findings(findings)
+    # Combine and deduplicate all findings
+    raw_findings = [finding for result in results for finding in result]
+    raw_findings.extend(evidence_notes)
+    raw_findings = _dedupe_findings(raw_findings)
 
-    findings.sort(key=lambda f: (
+    # Sort everything
+    raw_findings.sort(key=lambda f: (
         SEVERITY_ORDER.get(str(f.get("severity", "")).lower(), 99),
         str(f.get("id", "")),
     ))
 
+    # Separate actionable findings from info/pass diagnostics
+    actionable_findings = []
+    audit_notes = []
+    
+    for f in raw_findings:
+        if str(f.get("severity", "")).lower() == "info":
+            audit_notes.append(f)
+        else:
+            actionable_findings.append(f)
+
+    # Calculate evidence confidence
     usable = int(meta.get("pages_usable", 0) or 0)
     requested = int(meta.get("pages_requested", 0) or 0)
     challenge = int(meta.get("pages_challenge", 0) or 0)
@@ -338,13 +354,13 @@ def orchestrate_audit(raw_url: str) -> dict:
         "evidence": evidence_level,
     }
 
+    # Summary now exclusively counts actionable defects
     summary = {
-        "total_findings": len(findings),
-        "critical": sum(str(f.get("severity", "")).lower() == "critical" for f in findings),
-        "high": sum(str(f.get("severity", "")).lower() == "high" for f in findings),
-        "medium": sum(str(f.get("severity", "")).lower() == "medium" for f in findings),
-        "low": sum(str(f.get("severity", "")).lower() == "low" for f in findings),
-        "info": sum(str(f.get("severity", "")).lower() == "info" for f in findings),
+        "total_findings": len(actionable_findings),
+        "critical": sum(str(f.get("severity", "")).lower() == "critical" for f in actionable_findings),
+        "high": sum(str(f.get("severity", "")).lower() == "high" for f in actionable_findings),
+        "medium": sum(str(f.get("severity", "")).lower() == "medium" for f in actionable_findings),
+        "low": sum(str(f.get("severity", "")).lower() == "low" for f in actionable_findings),
     }
 
     return {
@@ -364,7 +380,8 @@ def orchestrate_audit(raw_url: str) -> dict:
             "blocked_search_bots": meta.get("blocked_search_bots", []),
         },
         "summary": summary,
-        "findings": findings,
+        "findings": actionable_findings,
+        "audit_notes": audit_notes,
     }
 
 

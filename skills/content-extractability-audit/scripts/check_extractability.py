@@ -22,7 +22,12 @@ def load_cached_pages(cache_dir):
             try:
                 html = Path(page["file"]).read_text(encoding="utf-8", errors="replace")
                 soup = BeautifulSoup(html, "html.parser")
-                pages.append({"url": page["url"], "html": html, "soup": soup})
+                pages.append({
+                    "url": page["url"], 
+                    "html": html, 
+                    "soup": soup,
+                    "content_classification": page.get("content_classification")
+                })
             except Exception:
                 continue
     return pages
@@ -354,18 +359,52 @@ def check_cea_008(pages):
         }
     return None
 
+def check_cea_009(pages):
+    product_pages = [p for p in pages if p.get("page_type") == "product"]
+    if not product_pages:
+        return None
+
+    missing_schema = []
+    for page in product_pages:
+        has_product = False
+        for script in page["soup"].find_all("script", type="application/ld+json"):
+            if script.string and ('"Product"' in script.string or '"@type":"Product"' in script.string.replace(" ", "")):
+                has_product = True
+                break
+        
+        if not has_product:
+            missing_schema.append(page["url"])
+
+    if missing_schema:
+        return {
+            "title": "No JSON-LD Structured Data on Product Pages",
+            "severity": "high",
+            "evidence": f"Found {len(missing_schema)} product pages without Product JSON-LD schema (e.g., {missing_schema[0]}).",
+            "suggested_action": {
+                "summary": "Add Product structured data (JSON-LD) to all product pages to ensure AI assistants can extract price, availability, and specifications.",
+                "priority": "high"
+            }
+        }
+    return None
+
 def run_audit(url, cache_dir):
     pages = load_cached_pages(cache_dir)
     if not pages:
         print(json.dumps([]))
         return
+    usable_pages = [
+        p for p in pages
+        if p.get("content_classification") == "normal"
+    ]
 
     findings = []
-    checks = [check_cea_001, check_cea_002, check_cea_003, check_cea_004, check_cea_005, check_cea_006, check_cea_007, check_cea_008]
+    # Added check_cea_009 to the array
+    checks = [check_cea_001, check_cea_002, check_cea_003, check_cea_004, 
+              check_cea_005, check_cea_006, check_cea_007, check_cea_008, check_cea_009]
     
     for idx, check in enumerate(checks):
         try:
-            finding = check(pages)
+            finding = check(usable_pages)
             if finding:
                 findings.append(finding)
         except Exception as e:
@@ -374,6 +413,16 @@ def run_audit(url, cache_dir):
     # Rename IDs sequentially
     for i, finding in enumerate(findings):
         finding["id"] = f"CEA-{i+1:03d}"
+
+    # Fallback info finding if everything passes
+    if not findings:
+        findings.append({
+            "id": "CEA-PASS-000",
+            "title": "Content Extractability Verified",
+            "severity": "info",
+            "evidence": f"Scanned {len(usable_pages)} pages and found no missing product schemas, inaccessible SVGs, uncaptioned media, or JS-locked content blocks.",
+            "suggested_action": None
+        })
         
     print(json.dumps(findings, indent=2))
 

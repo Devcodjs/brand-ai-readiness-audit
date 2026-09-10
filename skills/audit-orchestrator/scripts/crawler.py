@@ -429,14 +429,18 @@ class SiteCrawler:
             meta["failure_reason"] = homepage_record.get("error", "Unknown fetch error")
 
         candidates = []
+        
+        # 1. SITEMAP FIRST: Prioritize canonical, machine-readable syndication
+        candidates.extend(self._read_sitemap_urls())
+        
+        # 2. DOM SUPPLEMENT: Fall back to homepage links to catch orphaned pages
         homepage_path = PAGES_DIR / "page_0.html"
         if homepage_record["success"] and homepage_path.exists():
             candidates.extend(
                 self.extract_internal_links(homepage_path.read_text(encoding="utf-8"))
             )
 
-        # Sitemap is useful not only when the root is blocked; it improves sample diversity.
-        candidates.extend(self._read_sitemap_urls())
+        # 3. SAMPLE: The deduplication will now favor the clean sitemap URLs
         urls_to_fetch = self.sample_urls(candidates)
 
         if urls_to_fetch:

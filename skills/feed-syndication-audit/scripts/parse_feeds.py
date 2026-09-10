@@ -6,9 +6,31 @@ from pathlib import Path
 def audit_syndication(cache_dir: str) -> list[dict]:
     findings = []
     sitemap_path = Path(cache_dir) / "sitemap.xml"
-    
+    index_file = Path(cache_dir) / "cache_index.json"
+
+    # Read the orchestrator's state to contextualize the missing sitemap
+    crawl_status = "unknown"
+    if index_file.exists():
+        try:
+            manifest = json.loads(index_file.read_text(encoding="utf-8"))
+            crawl_status = manifest.get("meta", {}).get("crawl_status", "unknown")
+        except json.JSONDecodeError:
+            pass
+
     if not sitemap_path.exists():
-        # Do not output an error here; the network-accessibility skill already handled the "None Observed" finding.
+        # If the site was blocked by a WAF/robots, the network skill already reported it.
+        # But if the site is openly crawlable and just lacks a sitemap, we flag it here.
+        if crawl_status == "success":
+            findings.append({
+                "id": "FEED-SYNC-MISSING",
+                "title": "Missing Public XML Sitemap",
+                "severity": "medium",
+                "evidence": "The site allows direct crawling, but no standard XML sitemap was found at the root or declared in robots.txt.",
+                "suggested_action": {
+                    "summary": "Even when direct HTML crawling is permitted, AI search engines rely on XML sitemaps to discover new content efficiently without brute-forcing your site architecture. Publish a sitemap.xml to guarantee rapid indexing.",
+                    "priority": "medium"
+                }
+            })
         return findings
 
     try:
@@ -31,7 +53,7 @@ def audit_syndication(cache_dir: str) -> list[dict]:
                 "severity": "info",
                 "evidence": f"Successfully parsed {url_count} URLs from the local sitemap XML.",
                 "suggested_action": {
-                    "summary": "Excellent. The site exposes a substantial public information architecture. Ensure this sitemap is automatically submitted to major search providers.",
+                    "summary": "The site exposes a substantial public information architecture. Ensure this sitemap is submitted via Google Search Console and Bing Webmaster Tools to feed AI grounding indices.",
                     "priority": "low"
                 }
             })

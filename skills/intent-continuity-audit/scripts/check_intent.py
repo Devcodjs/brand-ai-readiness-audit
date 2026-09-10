@@ -40,19 +40,29 @@ def check_ica_001(pages):
     for page in pages:
         soup = page['soup']
         for el in soup.find_all(True):
+            style = el.get('style', '').lower()
+            
+            # Skip elements explicitly hidden in the static DOM
+            if 'display:none' in style or 'display: none' in style or \
+               'visibility:hidden' in style or 'visibility: hidden' in style or \
+               'opacity:0' in style or 'opacity: 0' in style or el.has_attr('hidden'):
+                continue
+
             cls = " ".join(el.get('class', []))
             id_val = el.get('id', '')
             match = overlay_patterns.search(cls) or overlay_patterns.search(id_val)
+            
             if match or el.name == 'dialog':
-                style = el.get('style', '').lower()
                 has_fixed = 'position:fixed' in style or 'position:absolute' in style or 'position: fixed' in style or 'position: absolute' in style
                 
-                is_login = el.find('input', type='password') or re.search(r'paywall|login-wall|gated|premium-content|subscriber-only', cls + " " + id_val, re.I)
-                if is_login:
-                    has_high_severity = True
-                
-                found_overlays.append(f"{el.name}.{cls.replace(' ', '.')}")
-                break
+                # Apply the filter: only flag if explicitly positioned or a native dialog
+                if has_fixed or el.name == 'dialog':
+                    is_login = el.find('input', type='password') or re.search(r'paywall|login-wall|gated|premium-content|subscriber-only', cls + " " + id_val, re.I)
+                    if is_login:
+                        has_high_severity = True
+                    
+                    found_overlays.append(f"{el.name}.{cls.replace(' ', '.')}")
+                    break
                 
     if found_overlays:
         severity = "high" if has_high_severity else "medium"
@@ -62,7 +72,7 @@ def check_ica_001(pages):
             "evidence": f"Found {len(found_overlays)} overlay-pattern elements across {len(pages)} pages: {list(set(found_overlays))[:5]}. Elements with position:fixed/absolute block above-fold content on initial page load.",
             "suggested_action": {
                 "summary": "Replace full-viewport overlay modals with non-blocking inline banners. Defer newsletter popups until after meaningful engagement. Avoid login walls for informational content.",
-                "priority": "high"
+                "priority": severity
             }
         }
     return None

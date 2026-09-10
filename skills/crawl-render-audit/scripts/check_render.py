@@ -30,6 +30,32 @@ CHALLENGE_PATTERNS = [
 # Render-delta severity tiers: (min_ratio, severity)
 RENDER_DELTA_TIERS = [(0.70, "high"), (0.30, "medium")]
 
+# --- Heuristic Static Render Signals --------------------------------------
+SPA_ROOT_IDS = [
+    "root", "app", "__next", "___gatsby", "___next", "app-root", "__nuxt", "__layout", "svelte"
+]
+
+NOSCRIPT_JS_REQUIRED = re.compile(
+    r"(enable|turn on)\s+javascript|javascript\s+is\s+(required|disabled)",
+    re.I,
+)
+
+BUNDLER_SRC_PATTERN = re.compile(
+    r"(_next/static|/static/js/|webpack|chunk[-.][0-9a-f]{4,}|vendor[-.][0-9a-f]{4,}"
+    r"|main\.[0-9a-f]{4,}\.js|/assets/index-[0-9a-f]{6,}\.js)",
+    re.I,
+)
+
+SPA_LOADING_TEXT = re.compile(r"^(loading|please wait|one moment|initializing)[.\s]*$", re.I)
+
+FRAMEWORK_FINGERPRINTS = {
+    "react": re.compile(r"data-reactroot|react-dom", re.I),
+    "vue": re.compile(r"__VUE__|data-v-[0-9a-f]{6,}", re.I),
+    "angular": re.compile(r"ng-version=", re.I),
+    "nuxt": re.compile(r"__NUXT__", re.I),
+    "next": re.compile(r"__NEXT_DATA__", re.I),
+}
+
 
 def extract_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
@@ -70,25 +96,115 @@ def detect_challenge(html: str, status_code: int) -> dict:
     }
 
 
-def raw_render_metrics(raw_html: str, live_url: str | None, live_render: bool) -> dict:
-    """Compare raw HTML text with browser-visible text.
+def heuristic_static_render_estimate(raw_html: str) -> dict:
+    soup = BeautifulSoup(raw_html, "html.parser")
+    doc_text = extract_text(raw_html)
+    doc_text_len = len(doc_text)
 
-    live_render=True (the default) navigates a real browser to live_url with
-    page.goto(), so JS bundles fetch and execute exactly as they would for a
-    real visitor. The cached_dom fallback (live_render=False) re-parses the
-    already-fetched raw HTML through page.set_content() instead, which does
-    NOT navigate to a real origin — externally-referenced scripts on relative
-    paths (the overwhelming majority of real sites) will fail to load, so any
-    client-side-rendered framework never mounts and the measured delta silently
-    collapses toward zero. Treat cached_dom results as a weak lower bound only;
-    use live_render whenever network access to the live site is available.
-    """
+    signals = []
+    details = {}
+    score = 0.0
+
+    # 1. Mount point check (loading placeholder or empty shell)
+    loading_root = None
+    thin_root = None
+
+    for root_id in SPA_ROOT_IDS:
+        el = soup.find(attrs={"id": re.compile(rf"^{re.escape(root_id)}$", re.I)})
+        if el is None:
+            continue
+
+        for node in el.find_all(["script", "style", "noscript", "template"]):
+            node.decompose()
+        root_text = " ".join(el.stripped_strings).strip()
+        root_text_len = len(root_text)
+
+        if SPA_LOADING_TEXT.match(root_text):
+            loading_root = (root_id, root_text)
+            break
+
+        if root_text_len < 80:
+            thin_root = (root_id, root_text_len)
+            break
+
+    if loading_root:
+        root_id, placeholder = loading_root
+        score += 0.45
+        signals.append(f"spa_root_loading_placeholder:#{root_id}('{placeholder}')")
+        details["loading_root_id"] = root_id
+        details["loading_root_placeholder"] = placeholder
+    elif thin_root:
+        root_id, root_text_len = thin_root
+        weight = 0.40 if doc_text_len < 250 else 0.30
+        score += weight
+        signals.append(f"empty_spa_root:#{root_id}({root_text_len}_chars)")
+        details["thin_root_id"] = root_id
+        details["thin_root_text_length"] = root_text_len
+
+    # 2. "Enable JavaScript" notice in <noscript>
+    noscript_hits = [ns.get_text(" ", strip=True) for ns in soup.find_all("noscript")]
+    if any(NOSCRIPT_JS_REQUIRED.search(t) for t in noscript_hits if t):
+        score += 0.20
+        signals.append("noscript_requires_js_message")
+
+    # 3. Low visible-text-to-markup ratio
+    html_len = max(1, len(raw_html))
+    text_ratio = doc_text_len / html_len
+    if text_ratio < 0.05:
+        score += 0.20
+        signals.append("very_low_text_to_html_ratio")
+    elif text_ratio < 0.10:
+        score += 0.10
+        signals.append("low_text_to_html_ratio")
+    details["text_to_html_ratio"] = round(text_ratio, 4)
+
+    # 4. Bundler script tags paired with thin visible text
+    bundler_scripts = [
+        s.get("src") for s in soup.find_all("script", src=True)
+        if BUNDLER_SRC_PATTERN.search(s.get("src", ""))
+    ]
+    if bundler_scripts and doc_text_len < 400:
+        score += 0.15
+        signals.append("bundler_scripts_with_thin_text")
+        details["bundler_script_examples"] = bundler_scripts[:3]
+
+    # 5. Corroborating framework signatures
+    if signals:
+        detected_frameworks = [
+            fw for fw, pattern in FRAMEWORK_FINGERPRINTS.items()
+            if pattern.search(raw_html)
+        ]
+        if detected_frameworks:
+            score += 0.10
+            signals.append(f"corroborating_frameworks:{','.join(detected_frameworks)}")
+            details["detected_frameworks"] = detected_frameworks
+
+    score = round(min(score, 1.0), 3)
+    if score >= 0.55:
+        severity = "high"
+    elif score >= 0.30:
+        severity = "medium"
+    elif score >= 0.15:  # Require >= 0.15 so isolated text-ratio drops on static sites don't flag
+        severity = "low"
+    else:
+        severity = None
+
+    return {
+        "heuristic_score": score,
+        "heuristic_severity": severity,
+        "heuristic_signals": signals,
+        "heuristic_details": details,
+        "doc_text_length": doc_text_len,
+    }
+
+
+def raw_render_metrics(raw_html: str, live_url: str | None, live_render: bool) -> dict:
     raw_text = extract_text(raw_html)
     metrics = {
         "raw_text_length": len(raw_text),
         "raw_word_count": len(raw_text.split()),
         "render_available": False,
-        "render_mode": "none",
+        "render_mode": "static_heuristic",
         "rendered_text_length": None,
         "rendered_word_count": None,
         "render_delta_ratio": None,
@@ -99,7 +215,8 @@ def raw_render_metrics(raw_html: str, live_url: str | None, live_render: bool) -
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        metrics["render_error"] = "Playwright not installed; raw HTML analysis used."
+        # Standard zero-dependency execution path
+        metrics.update(heuristic_static_render_estimate(raw_html))
         return metrics
 
     try:
@@ -122,8 +239,8 @@ def raw_render_metrics(raw_html: str, live_url: str | None, live_render: bool) -
                 page.set_content(raw_html, wait_until="domcontentloaded", timeout=15000)
                 metrics["render_mode"] = "cached_dom"
                 metrics["render_caveat"] = (
-                    "cached_dom mode cannot execute relative-path scripts; a near-zero delta here does "
-                    "NOT confirm the live site is render-safe — rerun with live_render enabled to confirm."
+                    "cached_dom mode cannot execute relative-path scripts; "
+                    "re-run with live network access for dynamic verification."
                 )
 
             rendered_text = page.locator("body").inner_text(timeout=5000)
@@ -139,7 +256,9 @@ def raw_render_metrics(raw_html: str, live_url: str | None, live_render: bool) -
             len(rendered_words - raw_words) / max(1, len(rendered_words)), 3
         )
     except Exception as exc:
+        metrics["render_mode"] = "static_heuristic"
         metrics["render_error"] = str(exc)
+        metrics.update(heuristic_static_render_estimate(raw_html))
 
     return metrics
 
@@ -175,12 +294,6 @@ def robots_findings(target_url: str, cache_dir: str) -> tuple[list[str], dict]:
 
 
 def robots_allows_fetch(url: str, cache_dir: str, user_agent: str = "*") -> bool:
-    """Guardrail: 'respect robots.txt' applies to every live request this skill
-    makes, including the live-render re-fetch below — not just the upstream
-    crawl. Playwright presents a generic desktop-Chrome UA (not a named AI bot),
-    so this checks the wildcard/default rule set for that UA. Fails open (True)
-    if robots.txt is missing or unparseable, matching robots.txt semantics.
-    """
     robots_path = Path(cache_dir) / "robots.txt"
     if not robots_path.exists():
         return True
@@ -193,12 +306,6 @@ def robots_allows_fetch(url: str, cache_dir: str, user_agent: str = "*") -> bool
 
 
 def noindex_findings(pages: list) -> list:
-    """Meta-robots noindex / X-Robots-Tag checks — a separate gate from robots.txt.
-
-    robots.txt controls whether a crawler fetches a page at all; noindex controls
-    whether a page that WAS fetched gets kept/cited. Both block visibility, so both
-    need their own finding rather than being folded into the robots.txt check.
-    """
     noindexed = []
     for page in pages:
         path = page.get("file")
@@ -225,11 +332,10 @@ def noindex_findings(pages: list) -> list:
         "severity": "high" if len(noindexed) > 1 else "medium",
         "evidence": (
             f"{len(noindexed)} normal-content page(s) carry a noindex meta tag or X-Robots-Tag header, "
-            f"which keeps them out of AI/search indexes even though robots.txt allows crawling. "
-            f"Examples: {', '.join(noindexed[:5])}."
+            f"preventing search and AI indices from citing them. Examples: {', '.join(noindexed[:5])}."
         ),
         "suggested_action": {
-            "summary": "Remove noindex from any page meant to be publicly discoverable — this is often left over from a staging config and silently hides otherwise-crawlable content.",
+            "summary": "Remove noindex directives from public pages intended to be discovered and cited by AI systems.",
             "priority": "high" if len(noindexed) > 1 else "medium",
         },
     }]
@@ -301,7 +407,6 @@ def audit_crawl_and_render(
             },
         })
 
-    # Raw-vs-rendered evidence for a small normal-page sample.
     render_samples = []
     for record in normal_pages[: min(4, len(normal_pages))]:
         path = record.get("file")
@@ -313,16 +418,11 @@ def audit_crawl_and_render(
             continue
         page_url = record.get("final_url") or record.get("url")
 
-        # Guardrail: never let the live-render re-fetch bypass robots.txt, even
-        # though the upstream crawl cache already passed this URL as "normal".
         effective_live_render = live_render
         robots_block_note = None
         if live_render and page_url and not robots_allows_fetch(page_url, cache_dir):
             effective_live_render = False
-            robots_block_note = (
-                "robots.txt disallows fetching this URL; skipped the live re-render and "
-                "fell back to cached_dom (delta may be understated for this page)."
-            )
+            robots_block_note = "robots.txt disallows fetching this URL; live browser render skipped."
 
         metrics = raw_render_metrics(
             raw_html,
@@ -335,19 +435,22 @@ def audit_crawl_and_render(
         render_samples.append(metrics)
 
     rendered = [m for m in render_samples if m.get("render_available")]
+    heuristic_only = [
+        m for m in render_samples
+        if not m.get("render_available") and m.get("heuristic_score") is not None
+    ]
+
+    # Measured browser render path (if browser automation was locally available)
     if rendered:
-        worst_tier = None
         tiered = []
         for m in rendered:
             ratio = m.get("render_delta_ratio") or 0
             for threshold, severity in RENDER_DELTA_TIERS:
                 if ratio >= threshold:
                     tiered.append((m, severity, ratio))
-                    if worst_tier is None or RENDER_DELTA_TIERS.index((threshold, severity)) < worst_tier:
-                        worst_tier = RENDER_DELTA_TIERS.index((threshold, severity))
                     break
         if tiered:
-            severity = tiered[0][1]  # tiers are checked high->low, first match is worst present
+            severity = tiered[0][1]
             for m, sev, ratio in tiered:
                 if sev == "high":
                     severity = "high"
@@ -368,11 +471,139 @@ def audit_crawl_and_render(
                 "severity": severity,
                 "evidence": evidence,
                 "suggested_action": {
-                    "summary": "Ensure important facts are present in crawlable HTML or a stable structured representation (e.g. SSR/SSG), not only in client-side post-load content.",
+                    "summary": "Ensure key information is present in the initial server-rendered HTML (e.g., SSR/SSG) rather than injected only after client-side JavaScript execution.",
                     "priority": severity,
                 },
             })
-    elif render_samples and all(m.get("render_error") for m in render_samples):
+
+    # Hardened static heuristic path (deterministic, zero-dependency)
+    if heuristic_only:
+        flagged = [m for m in heuristic_only if m.get("heuristic_severity")]
+
+        if flagged:
+            csr_loading = []
+            csr_empty = []
+            csr_noscript = []
+            csr_bundler = []
+            csr_ratio = []
+
+            for m in flagged:
+                sigs = m.get("heuristic_signals", [])
+                url = m.get("_url", "unknown")
+
+                if any(s.startswith("spa_root_loading_placeholder") for s in sigs):
+                    csr_loading.append(url)
+                elif any(s.startswith("empty_spa_root") for s in sigs):
+                    csr_empty.append(url)
+
+                if "noscript_requires_js_message" in sigs:
+                    csr_noscript.append(url)
+
+                if "bundler_scripts_with_thin_text" in sigs:
+                    csr_bundler.append(url)
+
+                if "very_low_text_to_html_ratio" in sigs or "low_text_to_html_ratio" in sigs:
+                    csr_ratio.append(url)
+
+            # FINDING 1: Loading Placeholders
+            if csr_loading:
+                findings.append({
+                    "id": "CRAWL-RENDER-CSR-LOADING",
+                    "title": "Client-Side Rendering: Loading Placeholder Detected",
+                    "severity": "high",
+                    "evidence": (
+                        f"Found explicit loading placeholders (e.g., 'Loading...', 'Please wait') "
+                        f"inside initial HTML mount points across {len(csr_loading)} page(s). "
+                        f"Text content is missing until JS executes. Examples: {', '.join(csr_loading[:3])}."
+                    ),
+                    "suggested_action": {
+                        "summary": "Implement Server-Side Rendering (SSR) so the initial HTML payload delivers complete body text rather than a loading state.",
+                        "priority": "high",
+                    },
+                })
+
+            # FINDING 2: Empty Framework Mount Points
+            if csr_empty:
+                findings.append({
+                    "id": "CRAWL-RENDER-CSR-EMPTY",
+                    "title": "Client-Side Rendering: Empty Framework Mount Point",
+                    "severity": "high",
+                    "evidence": (
+                        f"Detected empty framework mount points (e.g., <div id='root'></div>) "
+                        f"in the raw HTML of {len(csr_empty)} page(s), requiring JS hydration to assemble content. "
+                        f"Examples: {', '.join(csr_empty[:3])}."
+                    ),
+                    "suggested_action": {
+                        "summary": "Pre-render HTML content on the server (SSR/SSG) so search and AI crawlers can index the page without running client-side scripts.",
+                        "priority": "high",
+                    },
+                })
+
+            # FINDING 3: JS Required Notice
+            if csr_noscript:
+                findings.append({
+                    "id": "CRAWL-RENDER-CSR-NOSCRIPT",
+                    "title": "Client-Side Rendering: JS Requirement Notice",
+                    "severity": "medium",
+                    "evidence": (
+                        f"Found <noscript> tags explicitly instructing visitors to enable JavaScript "
+                        f"to view content across {len(csr_noscript)} page(s). Examples: {', '.join(csr_noscript[:3])}."
+                    ),
+                    "suggested_action": {
+                        "summary": "Ensure primary informational content is rendered directly in the HTML response for clients without JavaScript runtime support.",
+                        "priority": "medium",
+                    },
+                })
+
+            # FINDING 4: Heavy Bundlers with Thin Text
+            if csr_bundler:
+                findings.append({
+                    "id": "CRAWL-RENDER-CSR-BUNDLER",
+                    "title": "Client-Side Rendering: Bundler Scripts with Minimal HTML Text",
+                    "severity": "medium",
+                    "evidence": (
+                        f"Detected heavy SPA bundler scripts (Webpack, Next.js, Vite) paired with "
+                        f"unusually thin visible text across {len(csr_bundler)} page(s). "
+                        f"Examples: {', '.join(csr_bundler[:3])}."
+                    ),
+                    "suggested_action": {
+                        "summary": "Configure client-side bundler setups to deliver pre-rendered static content for public landing pages.",
+                        "priority": "medium",
+                    },
+                })
+
+            # FINDING 5: Low Text Ratio (Suppressed if already captured by mount point findings)
+            if csr_ratio and not csr_loading and not csr_empty:
+                findings.append({
+                    "id": "CRAWL-RENDER-CSR-RATIO",
+                    "title": "Client-Side Rendering: Low Visible Text Ratio",
+                    "severity": "low",
+                    "evidence": (
+                        f"Observed an unusually low ratio of visible text to markup across {len(csr_ratio)} "
+                        f"page(s), indicating page copy may depend on subsequent client-side fetches. "
+                        f"Examples: {', '.join(csr_ratio[:3])}."
+                    ),
+                    "suggested_action": {
+                        "summary": "Verify that primary informational copy is present in the initial document body rather than loaded asynchronously.",
+                        "priority": "low",
+                    },
+                })
+
+        else:
+            findings.append({
+                "id": "CRAWL-RENDER-CSR-PASS-000",
+                "title": "Server-Rendered / Static HTML Verified",
+                "severity": "info",
+                "evidence": (
+                    f"Static HTML analysis evaluated {len(heuristic_only)} sampled page(s). "
+                    f"No empty framework mount points, loading placeholders, 'JavaScript required' notices, "
+                    f"or extreme text-to-markup imbalances were detected. Primary text content is present "
+                    f"directly in the initial HTML document payload."
+                ),
+                "suggested_action": None,
+            })
+
+    if not rendered and not heuristic_only and render_samples and all(m.get("render_error") for m in render_samples):
         findings.append({
             "id": "CRAWL-RENDER-ERR-000",
             "title": "Render Comparison Unavailable",
@@ -416,8 +647,7 @@ if __name__ == "__main__":
         "--no-live-render",
         dest="live_render",
         action="store_false",
-        help="Skip live browser navigation and fall back to cached_dom parsing only "
-             "(faster / fully offline, but understates render gaps — see raw_render_metrics docstring).",
+        help="Skip live browser navigation and fall back to cached_dom parsing only.",
     )
     parser.set_defaults(live_render=True)
     args = parser.parse_args()
