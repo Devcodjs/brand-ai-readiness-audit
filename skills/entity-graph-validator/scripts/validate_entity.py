@@ -40,8 +40,6 @@ MIN_SAME_AS = 2
 USER_AGENT = "BrandAIReadinessAudit/2.0 (+read-only; no-site-changes)"
 DEFAULT_TIMEOUT = 12
 
-# URL/path patterns and body fragments that strongly indicate that the crawler
-# did not receive the intended page. These are deliberately conservative.
 BLOCKED_PATH_MARKERS = (
     "/blocked",
     "/captcha",
@@ -50,6 +48,7 @@ BLOCKED_PATH_MARKERS = (
     "/security-check",
     "/robot-check",
     "/access-denied",
+    "/px/captcha",
 )
 CHALLENGE_TEXT_MARKERS = (
     "verify you are human",
@@ -63,6 +62,9 @@ CHALLENGE_TEXT_MARKERS = (
     "captcha",
     "security verification",
     "automated access",
+    "pardon our interruption",
+    "automated bot activity",
+    "perimeterx",
 )
 
 
@@ -82,7 +84,6 @@ def _types_of(schema: dict) -> Set[str]:
 
 
 def unpack_schemas(data: Any) -> List[dict]:
-    """Recursively unpack JSON-LD arrays and @graph objects."""
     out: List[dict] = []
     if isinstance(data, list):
         for item in data:
@@ -91,7 +92,6 @@ def unpack_schemas(data: Any) -> List[dict]:
         graph = data.get("@graph")
         if isinstance(graph, list):
             out.extend(unpack_schemas(graph))
-            # A top-level object may still itself be a schema node.
             if "@type" in data:
                 out.append(data)
         else:
@@ -100,7 +100,6 @@ def unpack_schemas(data: Any) -> List[dict]:
 
 
 def extract_page_schemas(html: str) -> Tuple[List[dict], int]:
-    """Return parsed JSON-LD nodes and count of malformed JSON-LD scripts."""
     soup = BeautifulSoup(html or "", "html.parser")
     nodes: List[dict] = []
     malformed = 0
@@ -118,7 +117,6 @@ def extract_page_schemas(html: str) -> Tuple[List[dict], int]:
 
 
 def extract_page_signals(html: str) -> Dict[str, Any]:
-    """Lightweight signals used to decide whether a page is semantically usable."""
     soup = BeautifulSoup(html or "", "html.parser")
     title = _norm(soup.title.get_text(" ", strip=True)) if soup.title else ""
     body_text = _norm(soup.get_text(" ", strip=True))
@@ -144,21 +142,18 @@ def looks_like_challenge(
     html: str = "",
     classification: str = "",
 ) -> Tuple[bool, str]:
-    """Detect common anti-bot/challenge/interstitial pages, including HTTP 200 ones."""
     urls = [url or "", final_url or ""]
     path_hit = any(any(marker in (urlparse(u).path or "").lower() for marker in BLOCKED_PATH_MARKERS) for u in urls)
     if path_hit:
         return True, "challenge_path"
 
-    if classification.lower() in {"challenge", "blocked", "access_denied", "captcha"}:
+    if classification.lower() in {"challenge", "blocked", "bot_challenge", "auth_wall", "access_denied", "captcha"}:
         return True, classification.lower()
 
     signals = extract_page_signals(html)
     if signals["challenge_markers"] and signals["body_len"] < 20000:
         return True, "challenge_text"
 
-    # Very short HTML + empty title is a common interstitial symptom. Keep it
-    # low-confidence so it doesn't over-classify legitimate utility pages.
     if signals["body_len"] < 250 and not signals["title"]:
         return True, "empty_interstitial"
 
@@ -172,7 +167,6 @@ def _host_matches(url: str, expected_host: str) -> bool:
 
 
 def _safe_fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
-    """Fetch read-only and classify transport vs challenge failures."""
     try:
         resp = requests.get(
             url,
@@ -188,7 +182,7 @@ def _safe_fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
         return {"ok": False, "kind": "connection_error", "error": str(exc)}
     except requests.RequestException as exc:
         return {"ok": False, "kind": "request_error", "error": str(exc)}
-    except Exception as exc:  # defensive; never crash the marketplace
+    except Exception as exc:
         return {"ok": False, "kind": "unknown_error", "error": str(exc)}
 
     content_type = (resp.headers.get("content-type") or "").lower()
@@ -242,9 +236,15 @@ def load_manifest(cache_dir: str) -> dict:
 def _page_is_usable(page: dict, html: Optional[str]) -> Tuple[bool, str]:
     if not page:
         return False, "missing_page_record"
-    classification = _norm(page.get("content_classification"))
-    if classification and classification.lower() != "normal":
-        return False, classification.lower()
+    classification = _norm(page.get("content_classification")).lower()
+    
+    # Explicit bypass based on classification
+    if classification in {"blocked", "bot_challenge", "challenge", "auth_wall", "access_denied", "captcha"}:
+        return False, f"classified_as_{classification}"
+    
+    if classification and classification != "normal":
+        return False, classification
+        
     url = page.get("url", "")
     final_url = page.get("final_url", "")
     if html is not None:
@@ -382,12 +382,6 @@ def _fallback_single_page(target_url: str) -> Tuple[List[dict], Dict[str, Any]]:
 
 
 def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Dict[str, Any]:
-    """Validate entity semantics and return findings plus evidence metadata.
-
-    The returned object intentionally includes evidence metadata in addition to
-    the traditional findings list. The orchestrator can use it to suppress
-    downstream semantic checks when crawl evidence is weak.
-    """
     manifest = load_manifest(cache_dir)
     raw_pages = manifest.get("pages", []) if isinstance(manifest, dict) else []
 
@@ -416,8 +410,6 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
         "evidence_confidence": "HIGH" if pages else "LOW",
     }
 
-    # Critical safety rule: if no normal pages are available, never report
-    # "missing JSON-LD" from the manifest. Report the evidence problem instead.
     if not pages:
         return {
             "findings": [
@@ -467,8 +459,6 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
                     org_missing_props[prop].append(page_url)
 
         page_type = _norm(page.get("page_type")).lower()
-        # Use the crawler's page_type as primary signal, but do not punish a
-        # product-like page merely because its type label is absent.
         is_product = page_type in PRODUCT_PAGE_TYPES
         if not is_product:
             path = (urlparse(page_url).path or "").lower()
@@ -491,9 +481,6 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
 
     findings: List[dict] = []
 
-    # 1. Overall JSON-LD coverage. Avoid calling this critical: a valid HTML
-    # page can use microdata/RDFa, and the rubric is about usefulness not one
-    # syntax. But for this marketplace we can still recommend JSON-LD.
     if pages_with_jsonld == 0:
         findings.append(_finding(
             "ENTITY-HIGH-001",
@@ -504,7 +491,6 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
             "high",
         ))
 
-    # 2. Core entity graph.
     if pages_with_org == 0 and pages_with_jsonld > 0:
         findings.append(_finding(
             "ENTITY-HIGH-002",
@@ -550,7 +536,6 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
                 "medium",
             ))
 
-    # 3. Product coverage only where product evidence exists.
     if product_pages_checked:
         missing = len(product_pages_missing_schema)
         if missing:
@@ -574,8 +559,6 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
             "medium",
         ))
 
-    # 4. Proactive improvements are explicitly allowed by the contest brief.
-    # They are info-level notes so they don't inflate defect counts.
     if pages_with_org and len(all_same_as) >= MIN_SAME_AS and not org_names:
         findings.append(_finding(
             "ENTITY-PROACTIVE-008",
@@ -598,7 +581,6 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
             "suggested_action": None,
         })
 
-    # Recommended next steps for the entrypoint, separate from findings.
     proactive = []
     if pages_with_jsonld and not page_schema_counts.get("WebPage"):
         proactive.append({

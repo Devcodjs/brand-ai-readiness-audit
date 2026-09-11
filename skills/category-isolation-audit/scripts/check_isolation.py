@@ -11,9 +11,6 @@ from urllib.parse import urljoin, urlparse, urldefrag
 from bs4 import BeautifulSoup
 
 
-# The crawler's classifier is useful evidence, but it is not authoritative.
-# Many modern commerce sites expose category pages as /c/<slug>, /category/<slug>,
-# /collections/<slug>, etc. while the crawler may label those pages as "other".
 EXPLICIT_CATEGORY_TYPES = {"category", "collection", "listing", "catalog"}
 EXCLUDED_PAGE_TYPES = {"product", "home", "search", "other"}
 
@@ -26,7 +23,6 @@ PRODUCT_URL_PATTERNS = [
     re.compile(r"/(?:p|product|products)/", re.I),
 ]
 
-# These are intentionally generic structural terms rather than brand-specific words.
 LISTING_TEXT_HINTS = re.compile(
     r"\b(sort|filter|filters|price|category|categories|results|products|items|shop|collection|collections)\b",
     re.I,
@@ -94,8 +90,6 @@ def remove_generic_copy(text: str) -> str:
 
 def extract_category_signals(html: str, page_url: str) -> dict:
     soup = BeautifulSoup(html, "html.parser")
-
-    # Capture useful metadata before removing page chrome.
     title = clean_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
     h1 = clean_text(soup.find("h1").get_text(" ", strip=True)) if soup.find("h1") else ""
 
@@ -122,11 +116,9 @@ def extract_category_signals(html: str, page_url: str) -> dict:
         if text:
             internal_links.append(text)
 
-    # Remove page chrome and likely product-card containers from descriptive-copy extraction.
     for node in soup.select("script, style, nav, footer, header, noscript, [role='navigation']"):
         node.decompose()
 
-    # Avoid double-counting product-card text. We keep product links themselves for graph checks.
     for selector in [
         "[class*='product-card' i]",
         "[class*='productcard' i]",
@@ -140,7 +132,6 @@ def extract_category_signals(html: str, page_url: str) -> dict:
     cleaned_text = remove_generic_copy(text)
     word_count = len(cleaned_text.split())
 
-    # Evidence that this is a listing/category rather than a product-detail page.
     structural_hints = 0
     if soup.find_all("h2") or soup.find_all("h3"):
         structural_hints += 1
@@ -169,7 +160,6 @@ def classify_category_candidate(page: dict, signals: dict) -> tuple[bool, int, l
     page_type = str(page.get("page_type") or "").lower().strip()
     url = signals["url"]
 
-    # Strong negative evidence first.
     if page_type == "product":
         return False, -99, ["manifest page_type=product"]
     if any(p.search(url) for p in PRODUCT_URL_PATTERNS):
@@ -198,7 +188,6 @@ def classify_category_candidate(page: dict, signals: dict) -> tuple[bool, int, l
         score += 1
         reasons.append("listing-page structural signals")
 
-    # Need either an explicit category type or a strong URL/listing combination.
     is_candidate = score >= 5 and (
         page_type in EXPLICIT_CATEGORY_TYPES
         or has_category_url_signal(url)
@@ -218,14 +207,21 @@ def choose_category_pages(pages: list[dict]) -> tuple[list[dict], list[dict], di
     }
 
     for page in pages:
-        if page.get("content_classification") != "normal":
+        classification = str(page.get("content_classification") or "").lower().strip()
+        page_url = page.get("final_url") or page.get("url", "unknown")
+        
+        # Explicit bypass for challenge and blocked pages
+        if classification in {"blocked", "bot_challenge", "challenge", "auth_wall", "access_denied", "captcha"}:
+            rejected.append({"url": page_url, "reason": f"crawler classified as {classification}"})
             continue
-        path = page.get("file")
-        if not path or not os.path.exists(path):
-            rejected.append({"url": page.get("final_url") or page.get("url", "unknown"), "reason": "missing cached HTML"})
+        if classification != "normal":
             continue
 
-        page_url = page.get("final_url") or page.get("url", "unknown")
+        path = page.get("file")
+        if not path or not os.path.exists(path):
+            rejected.append({"url": page_url, "reason": "missing cached HTML"})
+            continue
+
         try:
             html = Path(path).read_text(encoding="utf-8", errors="ignore")
         except OSError:
@@ -322,7 +318,6 @@ def run_audit(url: str, cache_dir: str = "audit-cache") -> list:
             },
         })
 
-    # 1. Thin/absent category copy, but only when the page really behaves like a product grid.
     thin_pages = [
         c for c in category_pages
         if c["signals"]["word_count"] < THIN_COPY_WORD_THRESHOLD
@@ -343,7 +338,6 @@ def run_audit(url: str, cache_dir: str = "audit-cache") -> list:
             "medium",
         )
 
-    # 2. Near-duplicate category copy. Compare normalized descriptive copy, not the whole DOM.
     comparable = [
         c for c in category_pages
         if c["signals"]["word_count"] >= THIN_COPY_WORD_THRESHOLD
@@ -373,7 +367,6 @@ def run_audit(url: str, cache_dir: str = "audit-cache") -> list:
             "medium",
         )
 
-    # 3. Product cross-listing. Only report when there is enough graph evidence and a meaningful share is shared.
     product_to_cats = defaultdict(set)
     for c in category_pages:
         for link in c["signals"]["product_links"]:
