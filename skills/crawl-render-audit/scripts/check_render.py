@@ -96,6 +96,100 @@ def detect_challenge(html: str, status_code: int) -> dict:
     }
 
 
+# URL/body-level evidence gate. This runs independently of the crawler's
+# content_classification so downstream audits do not trust a misclassified
+# interstitial as a real page.
+BLOCKED_URL_PATTERNS = (
+    "/blocked",
+    "/challenge",
+    "/captcha",
+    "/access-denied",
+    "/access_denied",
+    "/security-check",
+    "/verify",
+)
+
+INTERSTITIAL_MARKERS = (
+    "access denied",
+    "request blocked",
+    "verify you are human",
+    "checking your browser",
+    "enable javascript and cookies",
+    "unusual traffic",
+    "robot or human",
+    "security verification",
+    "captcha",
+)
+
+
+def classify_page_evidence(record: dict, html: str) -> dict:
+    """Return a conservative evidence classification for one cached page."""
+    url = (record.get("final_url") or record.get("url") or "").strip()
+    status = record.get("status_code") or record.get("status") or 200
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        status = 200
+
+    lowered_url = url.lower()
+    url_hits = [p for p in BLOCKED_URL_PATTERNS if p in lowered_url]
+
+    challenge = detect_challenge(html, status)
+    text = extract_text(html)
+    lowered_text = text[:12000].lower()
+    marker_hits = [m for m in INTERSTITIAL_MARKERS if m in lowered_text]
+
+    # Explicit blocked/challenge URLs are never usable evidence, even if the
+    # origin returns HTTP 200 and the body superficially looks like HTML.
+    if url_hits:
+        return {
+            "usable": False,
+            "classification": "bot_challenge",
+            "reason": "blocked_or_challenge_url",
+            "signals": url_hits,
+            "challenge_score": challenge["score"],
+        }
+
+    # Strong challenge evidence from body/status.
+    if challenge["is_challenge"]:
+        return {
+            "usable": False,
+            "classification": "bot_challenge",
+            "reason": "challenge_response",
+            "signals": challenge["signals"] + marker_hits[:5],
+            "challenge_score": challenge["score"],
+        }
+
+    # A short document with explicit interstitial wording should also be
+    # excluded. This catches vendors whose challenge page uses HTTP 200.
+    if marker_hits and len(text) < 1200:
+        return {
+            "usable": False,
+            "classification": "bot_challenge",
+            "reason": "short_interstitial",
+            "signals": marker_hits,
+            "challenge_score": max(challenge["score"], 0.50),
+        }
+
+    declared = record.get("content_classification")
+    if declared in {"blocked", "auth_wall", "bot_challenge"}:
+        return {
+            "usable": False,
+            "classification": declared,
+            "reason": "crawler_classification",
+            "signals": [declared],
+            "challenge_score": challenge["score"],
+        }
+
+    return {
+        "usable": True,
+        "classification": "normal",
+        "reason": "normal_page_evidence",
+        "signals": [],
+        "challenge_score": challenge["score"],
+    }
+
+
 def heuristic_static_render_estimate(raw_html: str) -> dict:
     soup = BeautifulSoup(raw_html, "html.parser")
     doc_text = extract_text(raw_html)
@@ -234,6 +328,19 @@ def raw_render_metrics(raw_html: str, live_url: str | None, live_render: bool) -
                 if response is not None and response.status in (403, 429, 503):
                     raise RuntimeError(f"Browser render returned HTTP {response.status}")
                 page.wait_for_timeout(1000)
+
+                browser_html = page.content()
+                browser_status = response.status if response is not None else 200
+                browser_gate = classify_page_evidence(
+                    {"final_url": page.url, "status_code": browser_status},
+                    browser_html,
+                )
+                if not browser_gate["usable"]:
+                    raise RuntimeError(
+                        "Browser render returned a challenge/interstitial response: "
+                        + ", ".join(browser_gate.get("signals", [])[:5])
+                    )
+
                 metrics["render_mode"] = "live_browser"
             else:
                 page.set_content(raw_html, wait_until="domcontentloaded", timeout=15000)
@@ -363,19 +470,53 @@ def audit_crawl_and_render(
         })
         return findings
 
-    challenge_pages = [p for p in pages if p.get("content_classification") == "bot_challenge"]
-    normal_pages = [p for p in pages if p.get("content_classification") == "normal"]
-    blocked_pages = [p for p in pages if p.get("content_classification") in {"blocked", "auth_wall"}]
+    # Re-validate every cached page independently. The crawl manifest is an
+    # input signal, not ground truth: a 200 response at /blocked?... is still
+    # not usable semantic evidence.
+    evidence_records = []
+    for page in pages:
+        path = page.get("file")
+        html = ""
+        if path and os.path.exists(path):
+            try:
+                html = Path(path).read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                html = ""
+        ev = classify_page_evidence(page, html)
+        page["_evidence_gate"] = ev
+        evidence_records.append((page, ev))
+
+    challenge_pages = [
+        p for p, ev in evidence_records
+        if ev["classification"] == "bot_challenge"
+    ]
+    normal_pages = [
+        p for p, ev in evidence_records
+        if ev["usable"]
+    ]
+    blocked_pages = [
+        p for p, ev in evidence_records
+        if ev["classification"] in {"blocked", "auth_wall"}
+    ]
 
     if challenge_pages:
-        sample_urls = [p.get("url") for p in challenge_pages[:5]]
+        sample_urls = []
+        challenge_reasons = []
+        for p in challenge_pages[:5]:
+            sample_urls.append(p.get("final_url") or p.get("url") or "unknown")
+            ev = p.get("_evidence_gate") or {}
+            for signal in ev.get("signals", []):
+                if signal not in challenge_reasons:
+                    challenge_reasons.append(signal)
+
         findings.append({
             "id": "CRAWL-CHALLENGE-001",
             "title": "Bot-Challenge Pages Detected",
             "severity": "high" if len(challenge_pages) >= max(2, len(pages) // 2) else "medium",
             "evidence": (
-                f"{len(challenge_pages)}/{len(pages)} sampled URLs returned content classified as "
-                f"bot-challenge/interstitial responses. Challenge URLs include: {', '.join(sample_urls)}."
+                f"{len(challenge_pages)}/{len(pages)} sampled URLs were rejected as usable semantic evidence "
+                f"because they matched blocked/challenge URL or interstitial-body signals. "
+                f"Examples: {', '.join(sample_urls)}. Signals: {', '.join(challenge_reasons[:6]) or 'none'}."
             ),
             "suggested_action": {
                 "summary": "Ensure important public content is retrievable by legitimate automated clients rather than replacing page content with challenge/interstitial responses.",
@@ -393,6 +534,7 @@ def audit_crawl_and_render(
                 "summary": "Restore crawlable access to representative public pages or provide an accessible structured surface such as sitemaps/feeds for the affected content.",
                 "priority": "high",
             },
+            "audit_effect": "page-dependent semantic checks are suppressed because trustworthy normal-page evidence is unavailable.",
         })
 
     if blocked_pages:
@@ -577,15 +719,15 @@ def audit_crawl_and_render(
                 findings.append({
                     "id": "CRAWL-RENDER-CSR-RATIO",
                     "title": "Client-Side Rendering: Low Visible Text Ratio",
-                    "severity": "low",
+                    "severity": "medium",
                     "evidence": (
-                        f"Observed an unusually low ratio of visible text to markup across {len(csr_ratio)} "
-                        f"page(s), indicating page copy may depend on subsequent client-side fetches. "
+                        f"Observed an unusually low ratio of visible text to HTML markup (< 10%) across {len(csr_ratio)} "
+                        f"page(s). Heavy DOMs with sparse text dilute the semantic signal for AI readers. "
                         f"Examples: {', '.join(csr_ratio[:3])}."
                     ),
                     "suggested_action": {
-                        "summary": "Verify that primary informational copy is present in the initial document body rather than loaded asynchronously.",
-                        "priority": "low",
+                        "summary": "Verify that core informational copy (product names, descriptions, pricing) is present in the initial server response. Consider pruning hidden DOM nodes (like off-canvas menus or excessive inline SVGs) that dilute the text-to-code ratio.",
+                        "priority": "medium",
                     },
                 })
 
