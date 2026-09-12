@@ -315,37 +315,6 @@ def audit_crawl_and_render(
         if ev["classification"] in {"blocked", "auth_wall"}
     ]
 
-    if challenge_pages:
-        sample_urls = [p.get("final_url") or p.get("url") or "unknown" for p in challenge_pages[:5]]
-        readable_targets = summarize_blocked_url_targets(sample_urls)
-        challenge_reasons = []
-        for p in challenge_pages[:5]:
-            ev = p.get("_evidence_gate") or {}
-            for signal in ev.get("signals", []):
-                if signal not in challenge_reasons:
-                    challenge_reasons.append(signal)
-
-        findings.append({
-            "id": "CRAWL-CHALLENGE-001",
-            "title": "Bot-Challenge Pages Detected",
-            "severity": "high" if len(challenge_pages) >= max(2, len(pages) // 2) else "medium",
-            "evidence": (
-                f"{len(challenge_pages)}/{len(pages)} sampled URLs were rejected as usable semantic evidence "
-                f"because they matched blocked/challenge URL or interstitial-body signals. "
-                f"Intended destination paths (recovered from the redirect URL, not confirmed page content): "
-                f"{', '.join(readable_targets)}. Signals: {', '.join(challenge_reasons[:6]) or 'none'}."
-            ),
-            "suggested_action": {
-                "summary": (
-                    "Direct web retrieval is restricted by challenge walls. If your organization distributes catalog "
-                    "entities through merchant feeds, sitemaps, or commercial partner APIs, this may be an intentional "
-                    "security stance. If not, autonomous AI agents cannot index your inventory without edge-level "
-                    "exemptions for verified AI user-agents."
-                ),
-                "priority": "high",
-            },
-        })
-
     if not normal_pages:
         findings.append({
             "id": "CRAWL-EVIDENCE-001",

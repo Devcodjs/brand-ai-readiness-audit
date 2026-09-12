@@ -233,6 +233,32 @@ def _eligible_skills(checks, meta: dict, pages: list[dict]) -> tuple[list[tuple[
     recovered_note = _recovered_paths_note(pages)
 
     evidence_notes = []
+
+    # 1. Site Typology Classification (Context-Aware Routing)
+    page_counts = meta.get("page_type_counts", {})
+    has_commerce = page_counts.get("product", 0) > 0 or page_counts.get("category", 0) > 0
+    has_local = page_counts.get("location", 0) > 0
+    is_informational = not has_commerce and not has_local
+
+    filtered_checks = []
+    for check in checks:
+        skill_name = check[0]
+        
+        # Suppress physical local-business checks for purely digital/informational sites
+        if is_informational and skill_name == "local-omnichannel-audit":
+            evidence_notes.append({
+                "id": "TYPOLOGY-SUPPRESS-LOCAL",
+                "title": "Local Audit Suppressed (Informational Site)",
+                "severity": "info",
+                "evidence": "Site classified as Informational/Media (0 product, category, or location pages detected). Local business footprint checks were disabled to prevent false positives.",
+                "suggested_action": None,
+                "skill": "audit-orchestrator",
+            })
+            continue
+            
+        filtered_checks.append(check)
+
+    # 2. WAF & Evidence Quality Logic
     if challenge_pages:
         evidence_notes.append({
             "id": "CRAWL-DATA-QUALITY",
@@ -257,7 +283,7 @@ def _eligible_skills(checks, meta: dict, pages: list[dict]) -> tuple[list[tuple[
         })
 
     if usable_pages == 0 or usable_ratio < 0.40:
-        selected = [c for c in checks if c[0] in ALWAYS_SAFE_SKILLS]
+        selected = [c for c in filtered_checks if c[0] in ALWAYS_SAFE_SKILLS]
         evidence_notes.append({
             "id": "CRAWL-SUPPRESS-001",
             "title": "Page-Level Audits Suppressed Due to Insufficient Evidence",
@@ -279,7 +305,7 @@ def _eligible_skills(checks, meta: dict, pages: list[dict]) -> tuple[list[tuple[
         })
         return selected, evidence_notes
 
-    return list(checks), evidence_notes
+    return filtered_checks, evidence_notes
 
 
 def _dedupe_findings(findings: list[dict]) -> list[dict]:
@@ -375,6 +401,30 @@ def orchestrate_audit(raw_url: str) -> dict:
 
     checks = _load_checks()
     checks, evidence_notes = _eligible_skills(checks, meta, pages)
+    
+    pivot_data = meta.get("subdomain_pivot")
+    if pivot_data and str(pivot_data.get("decision", "")).startswith("pivot_to::"):
+        pivot_target = pivot_data.get("decision", "").split("::")[-1]
+        reason = pivot_data.get("pivot_reason", "unknown")
+        
+        reason_desc = (
+            "a diffuse fan-out portal" if reason == "diffuse_fanout" 
+            else "a dominant content cluster" if reason == "dominant_cluster"
+            else reason
+        )
+        
+        evidence_notes.append({
+            "id": "CRAWL-PIVOT-001",
+            "title": "Autonomous Subdomain Pivot Executed",
+            "severity": "info",
+            "evidence": (
+                f"The initially requested URL acted as a thin routing page. "
+                f"The crawler autonomously pivoted to 'https://{pivot_target}' because it detected {reason_desc}. "
+                f"All subsequent audit checks reflect the content of this primary subdomain."
+            ),
+            "suggested_action": None,
+            "skill": "audit-orchestrator"
+        })
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(6, len(checks)))) as executor:
         results = list(executor.map(
@@ -434,6 +484,20 @@ def orchestrate_audit(raw_url: str) -> dict:
         "medium": sum(str(f.get("severity", "")).lower() == "medium" for f in actionable_findings),
         "low": sum(str(f.get("severity", "")).lower() == "low" for f in actionable_findings),
     }
+    
+    # Format pivot data to prevent JSON bloat from massive portals (e.g., Wikipedia)
+    raw_pivot = meta.get("subdomain_pivot")
+    display_pivot = None
+    if raw_pivot:
+        display_pivot = dict(raw_pivot)
+        if "other_netloc_counts" in display_pivot:
+            # Sort by count and keep only the top 3 subdomains
+            sorted_subs = sorted(
+                display_pivot["other_netloc_counts"].items(), 
+                key=lambda item: item[1], 
+                reverse=True
+            )
+            display_pivot["other_netloc_counts"] = dict(sorted_subs[:3])
 
     return {
         "site": resolved_url,
@@ -441,9 +505,13 @@ def orchestrate_audit(raw_url: str) -> dict:
         "audit_confidence": confidence,
         "crawl_summary": {
             "status": crawl_status,
+            "subdomain_pivot": display_pivot,
             "pages_requested": requested,
             "pages_usable": usable,
             "pages_challenge": challenge,
+            "pages_non_html": meta.get("pages_non_html", 0),           
+            "pages_duplicate": meta.get("pages_duplicate", 0),         
+            "non_html_details": meta.get("non_html_details", []),
             "usable_page_ratio": round(ratio, 3),
             "page_type_counts": meta.get("page_type_counts", {}),
             "pages_by_classification": meta.get("pages_by_classification", {}),

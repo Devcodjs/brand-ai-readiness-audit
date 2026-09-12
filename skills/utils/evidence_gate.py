@@ -248,15 +248,15 @@ def summarize_blocked_url_targets(urls, limit: int = 6) -> list[str]:
 
 def apply_evidence_gate(manifest: dict) -> dict:
     """
-    Run the ONE authoritative usability pass over every cached page, before
-    any check is scheduled. Mutates and returns `manifest` with `meta` counts
-    recomputed from the corrected classifications, so the suppression
-    decision, the final crawl_summary, and every dispatched skill all see the
-    same single, already-corrected picture — no ordering dependency, no race.
+    Evaluates cached pages. Updates existing meta counts natively without 
+    wiping out crawler-provided metrics like pages_requested or pages_duplicate.
     """
     pages = manifest.get("pages", [])
+    meta = manifest.get("meta", {})
+    
     corrected_count = 0
     corrected_urls = []
+    newly_challenged = 0
 
     for page in pages:
         path = page.get("file")
@@ -274,25 +274,25 @@ def apply_evidence_gate(manifest: dict) -> dict:
         if not evidence["usable"]:
             if was_normal:
                 corrected_count += 1
+                newly_challenged += 1
                 corrected_urls.append(page.get("final_url") or page.get("url", "unknown"))
             page["content_classification"] = evidence["classification"]
             page["success"] = False
 
-    counts: dict = {}
-    for page in pages:
-        kind = page.get("content_classification", "unknown")
-        counts[kind] = counts.get(kind, 0) + 1
+    # Safely adjust crawler meta counts instead of blindly overwriting them
+    original_usable = meta.get("pages_usable", len(pages))
+    original_challenge = meta.get("pages_challenge", 0)
+    requested = meta.get("pages_requested", max(1, len(pages)))
 
-    usable_pages = [p for p in pages if p.get("content_classification") == "normal"]
-    challenge_pages = [p for p in pages if p.get("content_classification") == "bot_challenge"]
+    new_usable = original_usable - corrected_count
+    new_challenge = original_challenge + newly_challenged
 
-    meta = manifest.setdefault("meta", {})
-    meta["pages_usable"] = len(usable_pages)
-    meta["pages_challenge"] = len(challenge_pages)
-    meta["pages_by_classification"] = counts
-    meta["usable_page_ratio"] = round(len(usable_pages) / max(1, len(pages)), 3)
-    meta["challenge_ratio"] = round(len(challenge_pages) / max(1, len(pages)), 3)
+    meta["pages_usable"] = new_usable
+    meta["pages_challenge"] = new_challenge
+    meta["usable_page_ratio"] = round(new_usable / requested, 3)
+    meta["challenge_ratio"] = round(new_challenge / requested, 3)
     meta["evidence_gate_corrections"] = corrected_count
     meta["evidence_gate_corrected_urls"] = corrected_urls[:10]
 
+    manifest["meta"] = meta
     return manifest

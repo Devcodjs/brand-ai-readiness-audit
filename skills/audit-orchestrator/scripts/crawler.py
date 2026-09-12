@@ -1,9 +1,11 @@
 import argparse
 import concurrent.futures
+import gzip
 import hashlib
 import json
 import re
 import shutil
+import sys
 import time
 import urllib.robotparser
 import xml.etree.ElementTree as ET
@@ -14,13 +16,10 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import requests
 from bs4 import BeautifulSoup
 
-import sys
-
 # Points directly to 'skills/utils'
 UTILS_DIR = Path(__file__).resolve().parents[2] / "utils"
 if str(UTILS_DIR) not in sys.path:
     sys.path.insert(0, str(UTILS_DIR))
-
 
 from evidence_gate import looks_like_blocked_url
 
@@ -67,30 +66,40 @@ PAGE_TYPE_HINTS = (
     ("article", ("/article/", "/blog/", "/news/", "/stories/", "/help/", "/learn/")),
 )
 
+# Standard file and API extensions that represent feeds, assets, or data endpoints
+# rather than crawlable, human/AI-readable HTML pages.
+EXCLUDED_EXTENSIONS = {
+    ".xml", ".xml.gz", ".json", ".atom", ".rss", ".js", ".css",
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg",
+    ".pdf", ".zip", ".gz", ".woff", ".woff2", ".ttf", ".ico",
+    ".mp4", ".mp3", ".webm", ".avi", ".mov", ".m4v"
+}
+
 # --- Subdomain-pivot tuning ---
-# Subdomains that host assets/infra rather than crawlable site content.
-# Even if one of these clusters more heavily than the real content
-# subdomain (e.g. a CDN referenced on every page), it's never the right
-# pivot target, so it's excluded before any counting happens.
 INFRA_SUBDOMAIN_LABELS = {
     "cdn", "static", "assets", "img", "images", "media", "api",
     "accounts", "account", "login", "auth", "sso", "help", "support",
     "status", "mail", "email", "cache", "edge", "ajax",
+    "corporate", "careers", "jobs", "investors", "affiliates" 
 }
-# Below this many same-subdomain links, a homepage is treated as too thin
-# to represent real site content on its own (a routing/portal page).
-# NOTE: this gate only applies to the "dominant cluster" pattern below -
-# see the ordering comment inside _evaluate_subdomain_pivot for why the
-# diffuse fan-out pattern must be checked BEFORE this gate, not after it.
 MIN_SELF_LINKS_TO_SKIP_PIVOT = 3
-# A single other subdomain clearly "wins" once it has this many links -
-# the classic blog.example.com / shop.example.com case.
 DOMINANT_CLUSTER_MIN_LINKS = 3
-# A portal that fans out to many DIFFERENT subdomains, each with only one
-# or two links (e.g. Wikipedia's ~300 language editions), is just as real
-# a signal even though no single one hits DOMINANT_CLUSTER_MIN_LINKS -
-# what matters there is breadth of distinct subdomains, not depth of any one.
 MIN_DISTINCT_SUBDOMAINS_FOR_FANOUT = 5
+
+
+def is_auditable_html(url: str) -> bool:
+    """
+    Prevents syndication feeds, API endpoints, and static media files
+    from polluting the candidate pool and consuming HTML crawler quota.
+    """
+    path = urlparse(url).path.lower()
+    for ext in EXCLUDED_EXTENSIONS:
+        if path.endswith(ext):
+            return False
+    if any(segment in path for segment in ("/cart.js", "/recommendations/products", "/api/")):
+        return False
+    return True
+
 
 def find_repository_root() -> Path:
     """Find the marketplace root without relying on a fixed directory depth."""
@@ -98,7 +107,6 @@ def find_repository_root() -> Path:
     for candidate in [here.parent, *here.parents]:
         if (candidate / "marketplace.json").exists() and (candidate / "skills").exists():
             return candidate
-    # Fallback preserves compatibility with the original repo layout.
     return here.parents[3]
 
 
@@ -214,15 +222,6 @@ class SiteCrawler:
         PAGES_DIR.mkdir(parents=True, exist_ok=True)
 
     def fetch_and_parse_robots(self) -> dict:
-        # Always parse into a FRESH parser. urllib.robotparser's internal
-        # _add_entry() keeps the *first* "User-agent: *" block it ever sees
-        # on a given instance ("the first default entry wins") and silently
-        # drops later ones. Since this method is called a second time after
-        # a subdomain pivot (see build_cache), reusing self.robot_parser
-        # would leave every is_allowed()/crawl_delay() check still running
-        # against the ORIGINAL domain's robots.txt instead of the pivoted
-        # target's - a real robots.txt-compliance bug, not just a stale-data
-        # one. A fresh instance per call makes this method safe to re-run.
         self.robot_parser = urllib.robotparser.RobotFileParser()
         self.robot_parser.set_url(f"{self.domain_root}/robots.txt")
 
@@ -314,11 +313,17 @@ class SiteCrawler:
             full_url = normalize_url(urljoin(self.domain_root, href))
             parsed_url = urlparse(full_url)
             if parsed_url.netloc == parsed_root.netloc and parsed_url.scheme == "https":
-                if self.is_allowed(full_url):
+                # Filter out asset and feed links discovered in the DOM
+                if is_auditable_html(full_url) and self.is_allowed(full_url):
                     discovered.add(full_url)
         return sorted(discovered)
 
     def _read_sitemap_urls(self) -> list[str]:
+        """
+        Reads cached sitemap.xml. If it is a sitemapindex (e.g. Shopify/WordPress),
+        unwraps child sitemaps prioritizing products, collections, articles, and pages
+        to extract actual HTML URLs instead of indexing XML files.
+        """
         sitemap_path = CACHE_DIR / "sitemap.xml"
         if not sitemap_path.exists():
             return []
@@ -328,21 +333,73 @@ class SiteCrawler:
             return []
 
         urls = []
+        is_index = root.tag.endswith("sitemapindex")
+
         for element in root.iter():
             if element.tag.endswith("loc") and element.text:
                 normalized = normalize_url(element.text.strip())
                 if urlparse(normalized).netloc == urlparse(self.domain_root).netloc:
                     if self.is_allowed(normalized):
                         urls.append(normalized)
-        return sorted(set(urls))
 
-    def sample_urls(self, candidates: Iterable[str]) -> list[str]:
-        """Choose a deterministic, representative sample rather than first-N URLs."""
+        # Handle Sitemap Index (Unwrap child sitemaps to get real HTML pages)
+        if is_index and urls:
+            def sitemap_priority(u: str) -> int:
+                u_low = u.lower()
+                if "product" in u_low:
+                    return 0
+                if "collection" in u_low or "category" in u_low:
+                    return 1
+                if "blog" in u_low or "article" in u_low:
+                    return 2
+                if "page" in u_low:
+                    return 3
+                return 4
+
+            child_sitemaps = sorted(urls, key=sitemap_priority)
+            extracted_html_urls = []
+
+            # Fetch top child sitemaps to seed a representative pool
+            for child_url in child_sitemaps[:4]:
+                try:
+                    resp = requests.get(child_url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT)
+                    if resp.status_code == 200 and resp.text.strip():
+                        raw_content = resp.content
+                        if child_url.endswith(".gz") or raw_content[:2] == b"\x1f\x8b":
+                            try:
+                                raw_content = gzip.decompress(raw_content)
+                            except Exception:
+                                pass
+                        child_root = ET.fromstring(raw_content)
+                        for el in child_root.iter():
+                            if el.tag.endswith("loc") and el.text:
+                                norm = normalize_url(el.text.strip())
+                                if (
+                                    urlparse(norm).netloc == urlparse(self.domain_root).netloc
+                                    and is_auditable_html(norm)
+                                    and self.is_allowed(norm)
+                                ):
+                                    extracted_html_urls.append(norm)
+                except Exception:
+                    continue
+
+            return sorted(set(extracted_html_urls))
+
+        # Standard urlset sitemap: return only auditable HTML targets
+        return sorted(set([u for u in urls if is_auditable_html(u)]))
+
+    def prioritized_urls(self, candidates: Iterable[str]) -> list[str]:
+        """
+        Deduplicates and sorts candidate URLs according to architectural quotas
+        to ensure diverse page-type representation across all categories.
+        """
         unique = []
         seen = set()
         for raw in candidates:
             normalized = normalize_url(raw)
             if normalized == self.target_url or normalized in seen:
+                continue
+            if not is_auditable_html(normalized):
                 continue
             parsed = urlparse(normalized)
             if parsed.netloc != urlparse(self.domain_root).netloc or parsed.scheme != "https":
@@ -350,17 +407,10 @@ class SiteCrawler:
             seen.add(normalized)
             unique.append(normalized)
 
-        # "home" is included here as a defensive backstop, not because we
-        # ever want to sample it: classify_url() can legitimately return
-        # "home" for a candidate URL (e.g. a stray homepage link that
-        # survives the self-exclusion check above in some edge case), and
-        # buckets[classify_url(url)] must never KeyError regardless. It gets
-        # no quota below, so any such URL is collected but never selected.
         buckets = {k: [] for k in ("home", "product", "category", "location", "article", "search", "other")}
         for url in unique:
             buckets[classify_url(url)].append(url)
 
-        # Prefer page types that reveal different audit surfaces.
         quota = {
             "product": 3,
             "category": 2,
@@ -373,52 +423,18 @@ class SiteCrawler:
         for kind, limit in quota.items():
             selected.extend(buckets[kind][:limit])
 
-        if len(selected) < self.max_pages:
-            leftovers = [u for u in unique if u not in set(selected)]
-            selected.extend(leftovers[: self.max_pages - len(selected)])
+        leftovers = [u for u in unique if u not in set(selected)]
+        return selected + leftovers
 
-        return selected[: max(0, self.max_pages - 1)]
+    def sample_urls(self, candidates: Iterable[str]) -> list[str]:
+        """Legacy compatibility method returning top-quota sampled URLs."""
+        return self.prioritized_urls(candidates)[: max(0, self.max_pages - 1)]
 
     def _evaluate_subdomain_pivot(self, html: str) -> str | None:
-        """
-        Detect if the current homepage is a routing portal with few local links,
-        and identify if a specific same-base subdomain should be crawled instead.
-
-        Two different patterns both count as "pivot-worthy":
-          1. Diffuse fan-out - many distinct subdomains each with only a
-             link or two (e.g. Wikipedia's ~300 per-language subdomains,
-             each linked once from the www.wikipedia.org portal).
-          2. A dominant cluster - one other subdomain clearly has more links
-             than any other (e.g. a blog/shop subdomain holding all the real
-             content: blog.example.com linked 20x from a bare www.example.com).
-
-        ORDERING (this was the actual Wikipedia bug): fan-out is now checked
-        BEFORE the current-page self-link gate, not after it. Previously the
-        gate ("does the current page already have >= MIN_SELF_LINKS_TO_SKIP_PIVOT
-        self-links? if so, it's real content, don't pivot") ran first and
-        short-circuited everything else. That's a reasonable question for an
-        ordinary homepage, but wrong for a portal: www.wikipedia.org has 4
-        self-links (logo, ToS, privacy policy - boilerplate) sitting right next
-        to ~272 distinct language subdomains. 4 >= 3 tripped the gate and the
-        fan-out signal - which was computed correctly the whole time - never
-        even got read. No ordinary site links to
-        MIN_DISTINCT_SUBDOMAINS_FOR_FANOUT+ distinct same-base subdomains from
-        its homepage; only a genuine portal does, regardless of how many
-        footer/legal links it also has to itself. So fan-out breadth is checked
-        on its own first, independent of current_count, and only if that
-        doesn't qualify does the self-link gate get a say (protecting the
-        dominant-cluster case from pivoting away from a page that already has
-        plenty of its own real content).
-
-        Diagnostics are stashed on self.last_pivot_diagnostics either way,
-        so build_cache() can surface *why* a pivot did or didn't happen -
-        useful for tuning the thresholds above against real sites.
-        """
         soup = BeautifulSoup(html, "html.parser")
         parsed_root = urlparse(self.domain_root)
         current_netloc = parsed_root.netloc
 
-        # Naive base domain extraction (strips www.)
         base_domain = current_netloc[4:] if current_netloc.startswith("www.") else current_netloc
 
         netloc_counts = {}
@@ -434,7 +450,6 @@ class SiteCrawler:
                 continue
 
             net = parsed_url.netloc
-            # Only count links sharing the base domain
             if net != base_domain and not net.endswith("." + base_domain):
                 continue
 
@@ -452,26 +467,28 @@ class SiteCrawler:
             "other_netloc_counts": other_counts,
         }
 
-        # --- Pattern 1: diffuse fan-out, checked FIRST and independent of
-        # current_count. See the ordering note in the docstring above for why.
+        # Pattern 1: Diffuse fan-out portal
         is_diffuse_fanout = len(other_counts) >= MIN_DISTINCT_SUBDOMAINS_FOR_FANOUT
-        if is_diffuse_fanout:
+        
+        # Protect enterprise mega-menus (Walmart) from being mistaken as portals (Wikipedia).
+        # A true portal has very few self-links. If a site has robust self-linking (> 15), 
+        # it is a real storefront, not a thin routing page.
+        PORTAL_MAX_SELF_LINKS = 10
+        
+        if is_diffuse_fanout and current_count <= PORTAL_MAX_SELF_LINKS:
             best_netloc = max(other_counts, key=other_counts.get)
             diagnostics["decision"] = f"pivot_to::{best_netloc}"
             diagnostics["pivot_reason"] = "diffuse_fanout"
             self.last_pivot_diagnostics = diagnostics
             return f"https://{best_netloc}"
 
-        # --- Pattern 2 gate: only an ordinary (non-portal) homepage with
-        # plenty of its own content should skip pivoting outright. This runs
-        # AFTER the fan-out check so it can no longer mask a portal's fan-out
-        # behind a handful of boilerplate self-links.
+        # Pattern 2 gate: Skip pivot if current subdomain has sufficient internal links
         if current_count >= MIN_SELF_LINKS_TO_SKIP_PIVOT:
             diagnostics["decision"] = "no_pivot_sufficient_self_links"
             self.last_pivot_diagnostics = diagnostics
             return None
 
-        # --- Pattern 2: dominant cluster - one other subdomain clearly wins.
+        # Pattern 2: Dominant cluster
         best_netloc, best_count = None, 0
         for net, count in other_counts.items():
             if count > best_count:
@@ -518,10 +535,9 @@ class SiteCrawler:
             record["final_url"] = str(resp.url)
             record["content_type"] = resp.headers.get("Content-Type", "")
 
-            # Extract the raw response text early for content checking
             html = resp.text or ""
 
-            # Prevent false non_html flags by checking the actual body text if the header is missing/weird
+            # Check if payload is non-HTML
             is_html_header = "html" in record["content_type"].lower()
             if not is_html_header and resp.status_code == 200:
                 content_start = html[:1000].lower()
@@ -540,10 +556,6 @@ class SiteCrawler:
             if challenge["is_challenge"]:
                 record["content_classification"] = "bot_challenge"
             elif resp.status_code == 200 and looks_like_blocked_url(record["final_url"]):
-                # Content-based challenge detection can miss a bot-defense
-                # system that returns HTTP 200 with bland, non-matching body
-                # text (e.g. Walmart's /blocked?url=... redirect target) —
-                # the URL itself is still a reliable tell.
                 record["content_classification"] = "bot_challenge"
             elif resp.status_code in (401, 407):
                 record["content_classification"] = "auth_wall"
@@ -585,7 +597,30 @@ class SiteCrawler:
         self.reset_cache_dir()
         meta = self.fetch_and_parse_robots()
 
+        # Initialize Post-Fetch Deduplication State
+        pages_manifest = []
+        seen_final_urls = set()
+        seen_signatures = set()
+
+        def ingest_records(records):
+            """Appends records to the manifest and flags identical pages as duplicates."""
+            for rec in records:
+                if rec.get("content_classification") == "normal":
+                    f_url = rec.get("final_url")
+                    sig = rec.get("content_signature")
+                    
+                    # If we've seen this URL after a redirect, or the text content is identical
+                    if (f_url and f_url in seen_final_urls) or (sig and sig in seen_signatures):
+                        rec["content_classification"] = "duplicate"
+                    else:
+                        if f_url: seen_final_urls.add(f_url)
+                        if sig: seen_signatures.add(sig)
+                
+                pages_manifest.append(rec)
+
+        # 1. Fetch Homepage
         homepage_record = self.fetch_page(self.target_url, 0)
+        ingest_records([homepage_record])
 
         # --- Subdomain Pivot Logic ---
         pivot_diagnostics = None
@@ -596,34 +631,22 @@ class SiteCrawler:
             pivot_diagnostics = self.last_pivot_diagnostics
 
             if pivot_root:
-                # Pivot to the dominant subdomain. target_url MUST go through
-                # normalize_url() here, same as every discovered link does -
-                # otherwise this ends up as "https://en.wikipedia.org" (no
-                # trailing slash) while a link back to that same homepage
-                # normalizes to "https://en.wikipedia.org/", the two never
-                # string-compare equal in sample_urls()'s self-exclusion
-                # check, and that stray homepage link slips through
-                # classify_url() as "home" - a bucket sample_urls() doesn't
-                # define, causing a KeyError('home') crash.
                 self.target_url = normalize_url(pivot_root)
                 self.domain_root = pivot_root
-
-                # Re-fetch robots.txt under the new subdomain's rules
                 meta = self.fetch_and_parse_robots()
-
-                # Re-fetch the new target as the authoritative page_0
+                
+                # Re-fetch new pivot target and reset the deduplication state
+                pages_manifest.clear()
+                seen_final_urls.clear()
+                seen_signatures.clear()
                 homepage_record = self.fetch_page(self.target_url, 0)
+                ingest_records([homepage_record])
 
-        # meta may have been replaced by the re-fetch above; attach the
-        # pivot diagnostics afterward either way so it's always visible in
-        # cache_index.json, whether or not a pivot actually happened.
         if pivot_diagnostics is not None:
             meta["subdomain_pivot"] = pivot_diagnostics
         # ----------------------------------
 
-        pages_manifest = [homepage_record]
-
-        # The homepage can be challenged even with HTTP 200; that is not a normal crawl.
+        # Handle top-level crawl failures
         if homepage_record["content_classification"] == "bot_challenge":
             meta["crawl_status"] = "blocked_by_waf"
             meta["failure_reason"] = "Homepage returned bot-challenge/interstitial content"
@@ -641,22 +664,46 @@ class SiteCrawler:
 
         candidates = []
 
-        # 1. SITEMAP FIRST: Prioritize canonical, machine-readable syndication
+        # 1. SITEMAP FIRST: Unwraps sitemap indexes and loads canonical product/category URLs
         candidates.extend(self._read_sitemap_urls())
 
-        # 2. DOM SUPPLEMENT: Fall back to homepage links to catch orphaned pages
-        # Re-assign homepage_path just in case it wasn't captured above
+        # 2. DOM SUPPLEMENT: Fall back to homepage internal links to catch unlisted pages
         homepage_path = PAGES_DIR / "page_0.html"
         if homepage_record["success"] and homepage_path.exists():
             candidates.extend(
                 self.extract_internal_links(homepage_path.read_text(encoding="utf-8"))
             )
 
-        # 3. SAMPLE: The deduplication will now favor the clean sitemap URLs
-        urls_to_fetch = self.sample_urls(candidates)
+        # 3. SAMPLE & REFILL: Fetch candidates and refill quota if any return non-HTML, errors, or duplicates
+        candidate_pool = self.prioritized_urls(candidates)
+        initial_target_count = max(0, self.max_pages - 1)
+        urls_to_fetch = candidate_pool[:initial_target_count]
+        remaining_pool = candidate_pool[initial_target_count:]
 
         if urls_to_fetch:
-            pages_manifest.extend(self._fetch_many(urls_to_fetch, 1))
+            initial_records = self._fetch_many(urls_to_fetch, 1)
+            ingest_records(initial_records)
+
+        # Dynamic Refill Loop: Replace failed, non-HTML, or DUPLICATE slots with next available candidates
+        max_refill_fetches = 6
+        refill_fetches_done = 0
+
+        while remaining_pool and refill_fetches_done < max_refill_fetches:
+            usable_count = sum(1 for p in pages_manifest if p.get("content_classification") == "normal")
+            if usable_count >= self.max_pages:
+                break
+            
+            needed = self.max_pages - usable_count
+            refill_batch = remaining_pool[:needed]
+            remaining_pool = remaining_pool[needed:]
+
+            if not refill_batch:
+                break
+
+            current_index = len(pages_manifest)
+            refill_records = self._fetch_many(refill_batch, current_index)
+            ingest_records(refill_records)
+            refill_fetches_done += len(refill_batch)
 
         pages_manifest.sort(key=lambda x: x["index"])
 
@@ -666,22 +713,39 @@ class SiteCrawler:
             counts[kind] = counts.get(kind, 0) + 1
 
         usable_pages = [p for p in pages_manifest if p.get("content_classification") == "normal"]
-        challenge_pages = [p for p in pages_manifest if p.get("content_classification") == "bot_challenge"]
+        challenge_pages = [
+            p for p in pages_manifest 
+            if p.get("content_classification") in {"bot_challenge", "blocked", "auth_wall"}
+        ]
+        non_html_pages = [
+            {
+                "url": p.get("url"),
+                "final_url": p.get("final_url"),
+                "content_type": p.get("content_type"),
+                "page_type": p.get("page_type"),
+            }
+            for p in pages_manifest
+            if p.get("content_classification") == "non_html"
+        ]
 
-        # Distinguish partial evidence from total failure.
         if usable_pages:
             if challenge_pages:
                 meta["crawl_status"] = "partial" if meta.get("crawl_status") == "success" else meta["crawl_status"]
         elif challenge_pages:
             meta["crawl_status"] = "blocked_by_waf"
             meta["failure_reason"] = (
-                "No normal HTML pages were retrieved; sampled URLs returned bot-challenge content."
+                f"No normal HTML pages were retrieved; {len(challenge_pages)} of "
+                f"{len(pages_manifest)} sampled URLs returned bot-challenge content."
             )
 
+        # 1. Compute and store all metadata using the FULL pages_manifest
         meta.update({
             "pages_requested": len(pages_manifest),
             "pages_usable": len(usable_pages),
             "pages_challenge": len(challenge_pages),
+            "pages_non_html": len(non_html_pages),
+            "pages_duplicate": counts.get("duplicate", 0),
+            "non_html_details": non_html_pages,
             "pages_by_classification": counts,
             "usable_page_ratio": round(len(usable_pages) / max(1, len(pages_manifest)), 3),
             "challenge_ratio": round(len(challenge_pages) / max(1, len(pages_manifest)), 3),
@@ -692,13 +756,29 @@ class SiteCrawler:
             },
         })
 
+        # 2. Filter the manifest and clean up the filesystem
+        clean_manifest = []
+        for page in pages_manifest:
+            if page.get("content_classification") == "normal":
+                clean_manifest.append(page)
+            else:
+                # Delete the physical file from the audit-cache/pages/ folder to save space
+                file_path = Path(page["file"])
+                if file_path.exists():
+                    try:
+                        file_path.unlink()
+                    except OSError:
+                        pass
+
+        # 3. Write ONLY the clean, normal pages to the cache index
         index_payload = {
             "site": self.target_url,
             "domain_root": self.domain_root,
             "cache_dir": str(CACHE_DIR.resolve()),
             "meta": meta,
-            "pages": pages_manifest,
+            "pages": clean_manifest,
         }
+        
         (CACHE_DIR / "cache_index.json").write_text(
             json.dumps(index_payload, indent=2), encoding="utf-8"
         )
