@@ -14,6 +14,16 @@ from urllib3.util.retry import Retry
 
 from crawler import SiteCrawler
 
+import sys
+from pathlib import Path
+
+# Points directly to 'skills/utils'
+UTILS_DIR = Path(__file__).resolve().parents[2] / "utils"
+if str(UTILS_DIR) not in sys.path:
+    sys.path.insert(0, str(UTILS_DIR))
+
+from evidence_gate import apply_evidence_gate, summarize_blocked_url_targets
+
 def find_repository_root() -> Path:
     """Find the marketplace root without relying on a fixed directory depth."""
     here = Path(__file__).resolve()
@@ -189,10 +199,38 @@ def _load_cache_manifest(cache_dir: str) -> dict:
         return {}
 
 
-def _eligible_skills(checks, meta: dict) -> tuple[list[tuple[str, Path]], list[dict]]:
+def _blocked_page_urls(pages: list[dict]) -> list[str]:
+    return [
+        p.get("final_url") or p.get("url", "")
+        for p in pages
+        if p.get("content_classification") in {"bot_challenge", "blocked", "auth_wall"}
+    ]
+
+
+def _recovered_paths_note(pages: list[dict]) -> str:
+    """
+    Blocked-redirect URLs (e.g. Walmart's /blocked?url=...) often still carry
+    the originally requested path, base64-encoded. Recovering it costs
+    nothing and gives a human reader some sense of what the crawler was
+    trying to reach. This is explicitly NOT confirmed page content — only
+    the intended destination path — and must always be framed that way.
+    """
+    recovered = summarize_blocked_url_targets(_blocked_page_urls(pages))
+    if not recovered:
+        return ""
+    return (
+        " Intended destination paths recovered from blocked-redirect URLs "
+        "(structure only — actual page content was never retrieved, so this "
+        "is NOT confirmed evidence of what those pages contain): "
+        + ", ".join(recovered) + "."
+    )
+
+
+def _eligible_skills(checks, meta: dict, pages: list[dict]) -> tuple[list[tuple[str, Path]], list[dict]]:
     usable_ratio = float(meta.get("usable_page_ratio", 0.0) or 0.0)
     usable_pages = int(meta.get("pages_usable", 0) or 0)
     challenge_pages = int(meta.get("pages_challenge", 0) or 0)
+    recovered_note = _recovered_paths_note(pages)
 
     evidence_notes = []
     if challenge_pages:
@@ -201,12 +239,18 @@ def _eligible_skills(checks, meta: dict) -> tuple[list[tuple[str, Path]], list[d
             "title": "Crawl Evidence Quality Reduced by Challenge Responses",
             "severity": "medium" if usable_pages else "high",
             "evidence": (
-                f"{challenge_pages} sampled pages were classified as bot challenges; "
-                f"{usable_pages} pages were classified as normal HTML pages "
+                f"{challenge_pages} sampled pages returned security challenges; "
+                f"{usable_pages} pages were normal HTML "
                 f"(usable-page ratio {usable_ratio:.0%})."
+                + recovered_note
             ),
             "suggested_action": {
-                "summary": "Treat challenge/interstitial responses as unavailable evidence and improve crawlable access for representative public pages.",
+                "summary": (
+                    "Enterprise bot mitigation is intercepting diagnostic crawlers. If you syndicate "
+                    "catalog data via private APIs or Merchant Center feeds, this barrier is expected. "
+                    "However, if you depend on zero-shot discovery from autonomous AI user-agents (e.g., GPTBot, Perplexity), "
+                    "consider implementing verified bot allowlists at your WAF/edge layer."
+                ),
                 "priority": "high" if not usable_pages else "medium",
             },
             "skill": "audit-orchestrator",
@@ -221,16 +265,20 @@ def _eligible_skills(checks, meta: dict) -> tuple[list[tuple[str, Path]], list[d
             "evidence": (
                 f"Only {usable_pages} of {meta.get('pages_requested', 0)} sampled pages were normal HTML; "
                 "page-dependent checks were suppressed to avoid false positives."
+                + recovered_note
             ),
             "suggested_action": {
-                "summary": "Restore access to representative normal pages before drawing conclusions about metadata, schema, breadcrumbs, category structure, or on-page engagement.",
-                "priority": "high",
+                "summary": (
+                    "In-depth semantic checks (schemas, titles, layout) were deferred because edge challenges "
+                    "obfuscated page content. If this platform relies on public web indexing rather than dedicated "
+                    "syndication feeds, ensure diagnostic and AI user-agents can access representative public landing pages."
+                ),
+                "priority": "medium",
             },
             "skill": "audit-orchestrator",
         })
         return selected, evidence_notes
 
-    # Moderate partial coverage: allow all checks, but their evidence can be qualified in the report.
     return list(checks), evidence_notes
 
 
@@ -298,11 +346,35 @@ def orchestrate_audit(raw_url: str) -> dict:
         }
 
     manifest = _load_cache_manifest(cache_dir)
+
+    # Run the ONE authoritative usability pass over every cached page here,
+    # synchronously, before any check is scheduled — and persist the
+    # correction immediately. Previously this reclassification only happened
+    # inside crawl-render-audit's own check, running concurrently with every
+    # other skill via the thread pool below; whichever skill's subprocess
+    # happened to read cache_index.json before that correction landed saw
+    # the crawler's original (sometimes wrong) classification instead. That
+    # produced a report where crawl_summary claimed 12/12 pages usable while
+    # a finding two lines below said 11/12 were blocked interstitials, and
+    # let those 11 blocked pages silently contaminate every other page-level
+    # check. Doing it once, here, before dispatch removes the ordering
+    # dependency entirely: every consumer below — the suppression decision,
+    # the final crawl_summary, every dispatched skill's own fresh read of
+    # cache_index.json — now sees the same already-corrected picture.
+    manifest = apply_evidence_gate(manifest)
+    try:
+        (Path(cache_dir) / "cache_index.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
     meta = manifest.get("meta", {})
+    pages = manifest.get("pages", [])
     crawl_status = meta.get("crawl_status", "unknown")
 
     checks = _load_checks()
-    checks, evidence_notes = _eligible_skills(checks, meta)
+    checks, evidence_notes = _eligible_skills(checks, meta, pages)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(6, len(checks)))) as executor:
         results = list(executor.map(

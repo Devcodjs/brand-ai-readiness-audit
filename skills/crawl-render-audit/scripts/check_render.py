@@ -2,34 +2,41 @@ import argparse
 import json
 import os
 import re
+import sys
 import urllib.robotparser
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 
-AI_BOTS = [
-    "GPTBot", "ClaudeBot", "PerplexityBot", "Google-Extended", "OAI-SearchBot",
-    "ChatGPT-User", "CCBot", "Bytespider", "Amazonbot", "meta-externalagent",
-]
-HIGH_PRIORITY_BOTS = {"OAI-SearchBot", "ChatGPT-User", "PerplexityBot", "ClaudeBot", "GPTBot"}
 
-CHALLENGE_PATTERNS = [
-    re.compile(r"verify\s+you\s+are\s+human", re.I),
-    re.compile(r"checking\s+your\s+browser", re.I),
-    re.compile(r"just\s+a\s+moment", re.I),
-    re.compile(r"security\s+check", re.I),
-    re.compile(r"robot\s+or\s+human", re.I),
-    re.compile(r"unusual\s+traffic", re.I),
-    re.compile(r"access\s+denied", re.I),
-    re.compile(r"captcha", re.I),
-    re.compile(r"enable\s+javascript\s+and\s+cookies", re.I),
-    re.compile(r"ray\s+id", re.I),
-    re.compile(r"pardon\s+our\s+interruption", re.I),
-    re.compile(r"automated\s+bot\s+activity", re.I),
-    re.compile(r"blocked\s+by\s+perimeterx", re.I),
-    re.compile(r"px-captcha", re.I),
+# Points directly to 'skills/utils'
+UTILS_DIR = Path(__file__).resolve().parents[2] / "utils"
+if str(UTILS_DIR) not in sys.path:
+    sys.path.insert(0, str(UTILS_DIR))
+
+from evidence_gate import (
+    BLOCKED_URL_PATTERNS,
+    CHALLENGE_PATTERNS,
+    classify_page_evidence,
+    detect_challenge,
+    extract_text,
+    summarize_blocked_url_targets,
+)
+
+# Named AI/search crawlers sites are actually allow-listing today — verified
+# against a real 2026 robots.txt, which explicitly named several of these
+# that weren't previously tracked here.
+AI_BOTS = [
+    "GPTBot", "ClaudeBot", "Claude", "Claude-SearchBot", "PerplexityBot",
+    "Perplexity-User", "Google-Extended", "Gemini", "OAI-SearchBot",
+    "ChatGPT-User", "CCBot", "Bytespider", "Amazonbot", "meta-externalagent",
+    "Grok",
 ]
+HIGH_PRIORITY_BOTS = {
+    "OAI-SearchBot", "ChatGPT-User", "PerplexityBot", "ClaudeBot",
+    "Claude", "Claude-SearchBot", "GPTBot", "Gemini", "Grok",
+}
 
 # Render-delta severity tiers: (min_ratio, severity)
 RENDER_DELTA_TIERS = [(0.70, "high"), (0.30, "medium")]
@@ -59,136 +66,6 @@ FRAMEWORK_FINGERPRINTS = {
     "nuxt": re.compile(r"__NUXT__", re.I),
     "next": re.compile(r"__NEXT_DATA__", re.I),
 }
-
-
-def extract_text(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    for node in soup(["script", "style", "noscript", "template"]):
-        node.decompose()
-    return " ".join(soup.stripped_strings)
-
-
-def detect_challenge(html: str, status_code: int) -> dict:
-    text = extract_text(html)
-    title = BeautifulSoup(html, "html.parser").title
-    title_text = title.get_text(" ", strip=True) if title else ""
-    combined = f"{title_text} {text[:5000]}"
-    matched = [p.pattern for p in CHALLENGE_PATTERNS if p.search(combined)]
-
-    score = 0.0
-    signals = []
-    if status_code in (403, 429):
-        score += 0.35
-        signals.append(f"http_{status_code}")
-    if matched:
-        score += min(0.55, 0.18 * len(matched))
-        signals.append("challenge_text")
-    if len(text) < 350:
-        score += 0.08
-        signals.append("very_short_document")
-    lower = html.lower()
-    if any(marker in lower for marker in ("cf-chl-", "challenge-platform", "turnstile", "captcha", "perimeterx")):
-        score += 0.18
-        signals.append("challenge_markup")
-
-    return {
-        "is_challenge": score >= 0.50,
-        "score": round(min(score, 1.0), 3),
-        "signals": sorted(set(signals)),
-        "patterns": sorted(set(matched)),
-        "text_length": len(text),
-    }
-
-
-BLOCKED_URL_PATTERNS = (
-    "/blocked",
-    "/challenge",
-    "/captcha",
-    "/access-denied",
-    "/access_denied",
-    "/security-check",
-    "/verify",
-    "/px/captcha",
-)
-
-INTERSTITIAL_MARKERS = (
-    "access denied",
-    "request blocked",
-    "verify you are human",
-    "checking your browser",
-    "enable javascript and cookies",
-    "unusual traffic",
-    "robot or human",
-    "security verification",
-    "captcha",
-    "pardon our interruption",
-    "automated bot activity",
-    "perimeterx",
-    "px-captcha",
-)
-
-
-def classify_page_evidence(record: dict, html: str) -> dict:
-    """Return a conservative evidence classification for one cached page."""
-    url = (record.get("final_url") or record.get("url") or "").strip()
-    status = record.get("status_code") or record.get("status") or 200
-    try:
-        status = int(status)
-    except (TypeError, ValueError):
-        status = 200
-
-    lowered_url = url.lower()
-    url_hits = [p for p in BLOCKED_URL_PATTERNS if p in lowered_url]
-
-    challenge = detect_challenge(html, status)
-    text = extract_text(html)
-    lowered_text = text[:12000].lower()
-    marker_hits = [m for m in INTERSTITIAL_MARKERS if m in lowered_text]
-
-    if url_hits:
-        return {
-            "usable": False,
-            "classification": "bot_challenge",
-            "reason": "blocked_or_challenge_url",
-            "signals": url_hits,
-            "challenge_score": challenge["score"],
-        }
-
-    if challenge["is_challenge"]:
-        return {
-            "usable": False,
-            "classification": "bot_challenge",
-            "reason": "challenge_response",
-            "signals": challenge["signals"] + marker_hits[:5],
-            "challenge_score": challenge["score"],
-        }
-
-    if marker_hits and len(text) < 1200:
-        return {
-            "usable": False,
-            "classification": "bot_challenge",
-            "reason": "short_interstitial",
-            "signals": marker_hits,
-            "challenge_score": max(challenge["score"], 0.50),
-        }
-
-    declared = record.get("content_classification")
-    if declared in {"blocked", "auth_wall", "bot_challenge"}:
-        return {
-            "usable": False,
-            "classification": declared,
-            "reason": "crawler_classification",
-            "signals": [declared],
-            "challenge_score": challenge["score"],
-        }
-
-    return {
-        "usable": True,
-        "classification": "normal",
-        "reason": "normal_page_evidence",
-        "signals": [],
-        "challenge_score": challenge["score"],
-    }
 
 
 def heuristic_static_render_estimate(raw_html: str) -> dict:
@@ -289,6 +166,7 @@ def heuristic_static_render_estimate(raw_html: str) -> dict:
 
 
 def raw_render_metrics(raw_html: str, live_url: str | None, live_render: bool) -> dict:
+    """Evaluates rendering metrics entirely using static HTML heuristics (no Playwright)."""
     raw_text = extract_text(raw_html)
     metrics = {
         "raw_text_length": len(raw_text),
@@ -302,66 +180,8 @@ def raw_render_metrics(raw_html: str, live_url: str | None, live_render: bool) -
         "render_error": None,
     }
 
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        metrics.update(heuristic_static_render_estimate(raw_html))
-        return metrics
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ))
-            page = context.new_page()
-
-            if live_render and live_url:
-                response = page.goto(live_url, wait_until="networkidle", timeout=20000)
-                if response is not None and response.status in (403, 429, 503):
-                    raise RuntimeError(f"Browser render returned HTTP {response.status}")
-                page.wait_for_timeout(1000)
-
-                browser_html = page.content()
-                browser_status = response.status if response is not None else 200
-                browser_gate = classify_page_evidence(
-                    {"final_url": page.url, "status_code": browser_status},
-                    browser_html,
-                )
-                if not browser_gate["usable"]:
-                    raise RuntimeError(
-                        "Browser render returned a challenge/interstitial response: "
-                        + ", ".join(browser_gate.get("signals", [])[:5])
-                    )
-
-                metrics["render_mode"] = "live_browser"
-            else:
-                page.set_content(raw_html, wait_until="domcontentloaded", timeout=15000)
-                metrics["render_mode"] = "cached_dom"
-                metrics["render_caveat"] = (
-                    "cached_dom mode cannot execute relative-path scripts; "
-                    "re-run with live network access for dynamic verification."
-                )
-
-            rendered_text = page.locator("body").inner_text(timeout=5000)
-            context.close()
-            browser.close()
-
-        metrics["render_available"] = True
-        metrics["rendered_text_length"] = len(rendered_text)
-        metrics["rendered_word_count"] = len(rendered_text.split())
-        raw_words = set(raw_text.split())
-        rendered_words = set(rendered_text.split())
-        metrics["render_delta_ratio"] = round(
-            len(rendered_words - raw_words) / max(1, len(rendered_words)), 3
-        )
-    except Exception as exc:
-        metrics["render_mode"] = "static_heuristic"
-        metrics["render_error"] = str(exc)
-        metrics.update(heuristic_static_render_estimate(raw_html))
-
+    # Pass the raw HTML directly to the heuristic analysis
+    metrics.update(heuristic_static_render_estimate(raw_html))
     return metrics
 
 
@@ -477,7 +297,6 @@ def audit_crawl_and_render(
         ev = classify_page_evidence(page, html)
         page["_evidence_gate"] = ev
         
-        # Override the orchestrator's generic classification if our render heuristics caught it as a challenge
         if not ev["usable"]:
             page["content_classification"] = ev["classification"]
 
@@ -497,10 +316,10 @@ def audit_crawl_and_render(
     ]
 
     if challenge_pages:
-        sample_urls = []
+        sample_urls = [p.get("final_url") or p.get("url") or "unknown" for p in challenge_pages[:5]]
+        readable_targets = summarize_blocked_url_targets(sample_urls)
         challenge_reasons = []
         for p in challenge_pages[:5]:
-            sample_urls.append(p.get("final_url") or p.get("url") or "unknown")
             ev = p.get("_evidence_gate") or {}
             for signal in ev.get("signals", []):
                 if signal not in challenge_reasons:
@@ -513,10 +332,16 @@ def audit_crawl_and_render(
             "evidence": (
                 f"{len(challenge_pages)}/{len(pages)} sampled URLs were rejected as usable semantic evidence "
                 f"because they matched blocked/challenge URL or interstitial-body signals. "
-                f"Examples: {', '.join(sample_urls)}. Signals: {', '.join(challenge_reasons[:6]) or 'none'}."
+                f"Intended destination paths (recovered from the redirect URL, not confirmed page content): "
+                f"{', '.join(readable_targets)}. Signals: {', '.join(challenge_reasons[:6]) or 'none'}."
             ),
             "suggested_action": {
-                "summary": "Ensure important public content is retrievable by legitimate automated clients rather than replacing page content with challenge/interstitial responses.",
+                "summary": (
+                    "Direct web retrieval is restricted by challenge walls. If your organization distributes catalog "
+                    "entities through merchant feeds, sitemaps, or commercial partner APIs, this may be an intentional "
+                    "security stance. If not, autonomous AI agents cannot index your inventory without edge-level "
+                    "exemptions for verified AI user-agents."
+                ),
                 "priority": "high",
             },
         })
@@ -579,6 +404,9 @@ def audit_crawl_and_render(
         if not m.get("render_available") and m.get("heuristic_score") is not None
     ]
 
+    # This block handles rendering if Playwright was available. 
+    # Since we removed Playwright, this block effectively will never run, 
+    # but is safely left intact in case future modules restore `render_available = True`.
     if rendered:
         tiered = []
         for m in rendered:
@@ -674,8 +502,18 @@ def audit_crawl_and_render(
                     "id": "CRAWL-RENDER-CSR-RATIO",
                     "title": "Client-Side Rendering: Low Visible Text Ratio",
                     "severity": "medium",
-                    "evidence": f"Observed an unusually low ratio of visible text to HTML markup (< 10%) across {len(csr_ratio)} page(s). Heavy DOMs with sparse text dilute the semantic signal for AI readers. Examples: {', '.join(csr_ratio[:3])}.",
-                    "suggested_action": {"summary": "Verify that core informational copy is present in the initial server response.", "priority": "medium"},
+                    "evidence": (
+                        f"Observed an unusually low ratio of visible text to HTML markup (< 10%) across {len(csr_ratio)} page(s). "
+                        f"Heavy DOM structures with sparse text dilute the semantic signal for AI readers. Examples: {', '.join(csr_ratio[:3])}."
+                    ),
+                    "suggested_action": {
+                        "summary": (
+                            "Low initial text density impairs LLM parsing of raw HTML responses. If search assistants "
+                            "do not ingest your content through pre-rendered feeds or structured APIs, verify that core "
+                            "informational copy (product specs, titles, pricing) is directly embedded in the server-delivered DOM."
+                        ),
+                        "priority": "medium",
+                    },
                 })
         else:
             findings.append({
@@ -715,7 +553,6 @@ def audit_crawl_and_render(
             "suggested_action": None,
         })
 
-    # Save mutated manifest with refined classifications back to disk for semantic audits
     try:
         index_path = Path(cache_dir) / "cache_index.json"
         index_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")

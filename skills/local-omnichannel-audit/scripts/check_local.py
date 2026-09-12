@@ -321,16 +321,25 @@ def run_checks(pages):
 
     # LOA-006
     try:
-        phone_pattern = re.compile(r'[\+]?[\d][\d\s\-\.\(\)]{6,}[\d]')
         page_phones = {}
+        
         for page in usable_pages:
-            text = extract_text(page["soup"])
-            phones = phone_pattern.findall(text)
+            soup = page.get("soup")
+            if not soup:
+                continue
+                
+            # Look for semantic phone links (<a href="tel:...">)
+            tel_links = soup.find_all("a", href=re.compile(r"^tel:", re.I))
+            
             norm_phones = set()
-            for p in phones:
-                norm = re.sub(r'\D', '', p)
-                if len(norm) >= 7:
+            for link in tel_links:
+                # Extract the phone number from the href attribute
+                raw_phone = link.get("href", "").replace("tel:", "").strip()
+                # Normalize by keeping only digits and the plus sign for country codes
+                norm = re.sub(r'[^\d\+]', '', raw_phone)
+                if 7 <= len(norm) <= 15:
                     norm_phones.add(norm)
+                    
             if norm_phones:
                 page_phones[page["url"]] = list(norm_phones)[0]
 
@@ -340,6 +349,7 @@ def run_checks(pages):
             first_phone = page_phones[first_url]
             inconsistent_url = None
             inconsistent_phone = None
+            
             for u in urls[1:]:
                 if page_phones[u] != first_phone:
                     inconsistent_url = u
@@ -349,11 +359,11 @@ def run_checks(pages):
             if inconsistent_url:
                 findings.append({
                     "id": "LOA-006",
-                    "title": "NAP Inconsistency",
+                    "title": "Inconsistent Phone Numbers Detected",
                     "severity": "medium",
-                    "evidence": f"NAP inconsistency detected: phone appears as '{first_phone}' on {first_url} and '{inconsistent_phone}' on {inconsistent_url}.",
+                    "evidence": f"Found conflicting semantic phone links (tel:): '{first_phone}' on {first_url} and '{inconsistent_phone}' on {inconsistent_url}.",
                     "suggested_action": {
-                        "summary": "Standardize NAP across every page and structured data. Use single canonical format matching Google Business Profile.",
+                        "summary": "Standardize your primary contact number across all 'tel:' links and footer elements to ensure AI agents do not surface conflicting contact info.",
                         "priority": "medium"
                     }
                 })

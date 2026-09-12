@@ -10,7 +10,8 @@ from bs4 import BeautifulSoup
 
 CURRENT_YEAR = 2026
 
-# Page types where freshness is especially meaningful.
+# Page types where freshness is especially meaningful. A BreadcrumbList or
+# Organization node not carrying dateModified isn't a defect; these are.
 FRESHNESS_SCHEMA_TYPES = {
     "Article",
     "NewsArticle",
@@ -33,7 +34,9 @@ CHALLENGE_CLASSIFICATIONS = {
 }
 
 # A blocked/interstitial URL should not be trusted even if an upstream
-# crawler accidentally labelled it "normal".
+# crawler accidentally labelled it "normal" — this is what catches
+# Walmart-style /blocked?url=... redirect targets regardless of how the
+# shared cache_index.json classified them.
 BLOCKED_URL_PATTERNS = (
     "/blocked",
     "/challenge",
@@ -101,12 +104,7 @@ def detect_challenge(html):
     lower = html.lower()
     if any(
         marker in lower
-        for marker in (
-            "cf-chl-",
-            "challenge-platform",
-            "turnstile",
-            "captcha",
-        )
+        for marker in ("cf-chl-", "challenge-platform", "turnstile", "captcha")
     ):
         score += 0.18
         signals.append("challenge_markup")
@@ -121,13 +119,20 @@ def detect_challenge(html):
 
 def page_is_usable(page, html):
     """
-    Independent evidence gate.
+    Independent evidence gate — do not trust content_classification alone,
+    since an upstream crawler can accidentally classify a block/interstitial
+    page as normal (this is what silently corrupted several unrelated
+    checks in real runs against bot-defended sites).
 
-    We do not trust content_classification alone because upstream crawlers
-    can accidentally classify a block/interstitial as normal.
+    Cheapest checks run first so the (relatively) expensive HTML-text
+    challenge scan only runs once nothing cheaper has already disqualified
+    the page — matters for the 5-minute runtime budget on large sites.
     """
     url = page.get("final_url") or page.get("url", "")
     classification = str(page.get("content_classification") or "").lower()
+
+    if not page.get("success", True):
+        return False, "crawl record marked unsuccessful"
 
     if classification in CHALLENGE_CLASSIFICATIONS:
         return False, "blocked classification"
@@ -138,9 +143,6 @@ def page_is_usable(page, html):
     challenge = detect_challenge(html)
     if challenge["is_challenge"]:
         return False, f"challenge evidence score={challenge['score']}"
-
-    if not page.get("success", True):
-        return False, "crawl record marked unsuccessful"
 
     return True, None
 
@@ -221,7 +223,6 @@ def load_cached_pages(cache_dir):
 def unpack_schemas(data):
     """Recursively extract all schema nodes, unpacking @graph arrays and lists."""
     schemas = []
-
     if isinstance(data, list):
         for item in data:
             schemas.extend(unpack_schemas(item))
@@ -230,7 +231,6 @@ def unpack_schemas(data):
             schemas.extend(unpack_schemas(data["@graph"]))
         else:
             schemas.append(data)
-
     return schemas
 
 
@@ -251,7 +251,6 @@ def parse_page_schemas(page):
         raw = script.string or script.get_text()
         if not raw:
             continue
-
         try:
             nodes.extend(unpack_schemas(json.loads(raw)))
         except (json.JSONDecodeError, TypeError):
@@ -260,23 +259,60 @@ def parse_page_schemas(page):
     return nodes, malformed
 
 
+def check_malformed_schema(pages):
+    """
+    Surface broken JSON-LD as its own finding rather than silently discarding
+    it. A syntax error means the ENTIRE node is unreadable to any parser —
+    a more serious problem than a missing date field, and easy to miss
+    if it's only ever counted internally and never reported.
+    """
+    if not pages:
+        return None
+
+    malformed_pages = []
+    for page in pages:
+        _, malformed = parse_page_schemas(page)
+        if malformed:
+            malformed_pages.append(page["url"])
+
+    if not malformed_pages:
+        return None
+
+    return {
+        "id": "FRESH-004",
+        "title": "Malformed JSON-LD Structured Data",
+        "severity": "medium",
+        "evidence": (
+            f"{len(malformed_pages)}/{len(pages)} page(s) contain a "
+            f"<script type=\"application/ld+json\"> block that fails to "
+            f"parse as valid JSON, so none of that node's data (including "
+            f"any freshness or entity information it carries) is usable by "
+            f"any parser. Examples: {', '.join(malformed_pages[:3])}."
+        ),
+        "suggested_action": {
+            "summary": (
+                "Validate JSON-LD output against a JSON parser as part of "
+                "the build/publish pipeline — a single trailing comma or "
+                "unescaped quote silently voids the entire schema node."
+            ),
+            "priority": "medium",
+        },
+    }
+
+
 def check_schema_dates(pages):
     """
     Check structured freshness only on schema nodes where a freshness signal
-    is meaningful. This avoids treating every arbitrary JSON-LD node as stale.
+    is meaningful, and only when there's enough evidence to generalize from.
     """
     if not pages:
         return None
 
     pages_with_relevant_schema = 0
     pages_missing_freshness = []
-    malformed_pages = []
 
     for page in pages:
-        nodes, malformed = parse_page_schemas(page)
-
-        if malformed:
-            malformed_pages.append(page["url"])
+        nodes, _ = parse_page_schemas(page)
 
         relevant_nodes = [
             node
@@ -315,8 +351,8 @@ def check_schema_dates(pages):
                 "summary": (
                     "Add an accurate dateModified and, where appropriate, "
                     "datePublished property to the relevant WebPage, Article, "
-                    "Product, or other freshness-sensitive schema node. Keep the "
-                    "value synchronized with the actual content state."
+                    "Product, or other freshness-sensitive schema node. Keep "
+                    "the value synchronized with the actual content state."
                 ),
                 "priority": "medium",
             },
@@ -328,8 +364,9 @@ def check_schema_dates(pages):
 def check_copyright_year(pages):
     """
     Treat the footer year as a weak, supporting signal rather than proof of
-    content staleness. A copyright year alone should not drive a high-severity
-    AI-readiness finding.
+    content staleness — low severity by design, and only scanned within a
+    footer-like container (not the whole page) to avoid matching unrelated
+    copyright notices (embedded widgets, quoted testimonials, stock media).
     """
     if not pages:
         return None
@@ -341,21 +378,15 @@ def check_copyright_year(pages):
 
         footers = soup.find_all("footer")
         if not footers:
-            footers = soup.find_all(
-                attrs={"class": re.compile(r"footer", re.I)}
-            )
+            footers = soup.find_all(attrs={"class": re.compile(r"footer", re.I)})
 
         if not footers:
             continue
 
         years = []
-
         for footer in footers:
             text = footer.get_text(separator=" ")
-            years.extend(
-                int(value)
-                for value in COPYRIGHT_YEAR_PATTERN.findall(text)
-            )
+            years.extend(int(v) for v in COPYRIGHT_YEAR_PATTERN.findall(text))
 
         if years and max(years) < CURRENT_YEAR:
             stale_pages.append(page["url"])
@@ -375,8 +406,9 @@ def check_copyright_year(pages):
         "suggested_action": {
             "summary": (
                 f"Review the site-wide copyright year and update it to "
-                f"{CURRENT_YEAR} when appropriate. Treat this as a housekeeping "
-                "signal rather than a substitute for actual content timestamps."
+                f"{CURRENT_YEAR} when appropriate. Treat this as a "
+                "housekeeping signal rather than a substitute for actual "
+                "content timestamps."
             ),
             "priority": "low",
         },
@@ -385,7 +417,6 @@ def check_copyright_year(pages):
 
 def check_sitemap_lastmod(cache_dir):
     sitemap_path = Path(cache_dir) / "sitemap.xml"
-
     if not sitemap_path.exists():
         return None
 
@@ -393,7 +424,6 @@ def check_sitemap_lastmod(cache_dir):
         content = sitemap_path.read_text(encoding="utf-8", errors="replace")
         soup = BeautifulSoup(content, "xml")
         urls = soup.find_all("url")
-
         if not urls:
             return None
 
@@ -411,13 +441,12 @@ def check_sitemap_lastmod(cache_dir):
                 "suggested_action": {
                     "summary": (
                         "Configure the CMS or publishing pipeline to emit "
-                        "accurate <lastmod> timestamps in the XML sitemap for "
-                        "URLs whose content changes are tracked."
+                        "accurate <lastmod> timestamps in the XML sitemap "
+                        "for URLs whose content changes are tracked."
                     ),
                     "priority": "medium",
                 },
             }
-
     except Exception as exc:
         sys.stderr.write(f"Error parsing sitemap: {exc}\n")
 
@@ -425,11 +454,17 @@ def check_sitemap_lastmod(cache_dir):
 
 
 def make_evidence_finding(audit):
+    """
+    Explain *why* freshness checks were skipped instead of silently
+    producing nothing — a bare list with zero findings is indistinguishable
+    from "this check didn't run" and from "this check ran and found nothing,"
+    which cost real detection-accuracy points in past runs.
+    """
     if audit["requested"] == 0:
         return {
             "id": "FRESH-EVIDENCE-000",
             "title": "Freshness Audit Has No Crawl Evidence",
-            "severity": "medium",
+            "severity": "high",
             "evidence": (
                 "cache_index.json contains no page records, so freshness "
                 "properties could not be evaluated."
@@ -448,20 +483,21 @@ def make_evidence_finding(audit):
             f"{reason} ({count})"
             for reason, count in audit["rejection_reasons"].most_common(4)
         )
-
         return {
             "id": "FRESH-EVIDENCE-001",
             "title": "Freshness Checks Suppressed Due to Insufficient Evidence",
-            "severity": "medium",
+            "severity": "high",
             "evidence": (
                 f"0/{audit['requested']} cached pages passed independent "
-                f"normal-content verification. Freshness checks were suppressed. "
-                f"Observed rejection reasons: {reasons or 'none recorded'}."
+                f"normal-content verification. Freshness checks were "
+                f"suppressed. Observed rejection reasons: "
+                f"{reasons or 'none recorded'}."
             ),
             "suggested_action": {
                 "summary": (
-                    "Restore access to representative normal HTML pages before "
-                    "drawing conclusions about schema dates or visible freshness."
+                    "Restore access to representative normal HTML pages "
+                    "before drawing conclusions about schema dates or "
+                    "visible freshness."
                 ),
                 "priority": "high",
             },
@@ -492,11 +528,16 @@ def main():
         if schema_finding:
             findings.append(schema_finding)
 
+        malformed_finding = check_malformed_schema(pages)
+        if malformed_finding:
+            findings.append(malformed_finding)
+
         copyright_finding = check_copyright_year(pages)
         if copyright_finding:
             findings.append(copyright_finding)
 
-    # Sitemap is an independent cache-level signal.
+    # Sitemap is an independent cache-level signal — runs regardless of
+    # whether any HTML pages were usable.
     sitemap_finding = check_sitemap_lastmod(args.cache_dir)
     if sitemap_finding:
         findings.append(sitemap_finding)
@@ -507,7 +548,6 @@ def main():
             if (Path(args.cache_dir) / "sitemap.xml").exists()
             else "no cached sitemap.xml was available for freshness analysis"
         )
-
         findings.append(
             {
                 "id": "FRESH-PASS-000",
@@ -515,43 +555,20 @@ def main():
                 "severity": "info",
                 "evidence": (
                     f"Verified {len(pages)} independently usable page(s); "
-                    f"{sitemap_state}. No freshness defect crossed the configured "
-                    "reporting thresholds."
+                    f"{sitemap_state}. No freshness defect crossed the "
+                    "configured reporting thresholds."
                 ),
-                "suggested_action": {
-                    "summary": (
-                        "Continue maintaining accurate dateModified/datePublished "
-                        "values and synchronized publishing metadata as content changes."
-                    ),
-                    "priority": "low",
-                },
+                "suggested_action": None,
             }
         )
 
-    # Include compact execution metadata without changing the required finding shape.
-    output = {
-        "url": args.url,
-        "audit_confidence": {
-            "execution": "HIGH",
-            "evidence": (
-                "HIGH"
-                if audit["usable"] >= 3
-                else "MEDIUM"
-                if audit["usable"] > 0
-                else "LOW"
-            ),
-        },
-        "crawl_evidence": {
-            "pages_requested": audit["requested"],
-            "pages_usable": audit["usable"],
-            "pages_rejected": audit["rejected"],
-            "pages_challenge": audit["challenge"],
-            "rejection_reasons": dict(audit["rejection_reasons"]),
-        },
-        "findings": findings,
-    }
-
-    print(json.dumps(output, indent=2))
+    # Flat findings list — matches the contract every other skill in this
+    # marketplace uses, so the orchestrator can merge it the same way. All
+    # the diagnostic detail (usable/rejected counts, rejection reasons) that
+    # a wrapped object would carry separately is already inside the
+    # FRESH-EVIDENCE-000/001 findings above, so nothing is lost by keeping
+    # this flat.
+    print(json.dumps(findings, indent=2))
 
 
 if __name__ == "__main__":

@@ -14,6 +14,16 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import requests
 from bs4 import BeautifulSoup
 
+import sys
+
+# Points directly to 'skills/utils'
+UTILS_DIR = Path(__file__).resolve().parents[2] / "utils"
+if str(UTILS_DIR) not in sys.path:
+    sys.path.insert(0, str(UTILS_DIR))
+
+
+from evidence_gate import looks_like_blocked_url
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -368,6 +378,12 @@ class SiteCrawler:
             record["content_signature"] = content_signature(page_text(html)) if html else None
 
             if challenge["is_challenge"]:
+                record["content_classification"] = "bot_challenge"
+            elif resp.status_code == 200 and looks_like_blocked_url(record["final_url"]):
+                # Content-based challenge detection can miss a bot-defense
+                # system that returns HTTP 200 with bland, non-matching body
+                # text (e.g. Walmart's /blocked?url=... redirect target) —
+                # the URL itself is still a reliable tell.
                 record["content_classification"] = "bot_challenge"
             elif resp.status_code in (401, 407):
                 record["content_classification"] = "auth_wall"
