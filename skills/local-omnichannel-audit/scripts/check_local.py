@@ -460,7 +460,109 @@ def run_checks(pages):
     except Exception as e:
         sys.stderr.write(f"Error in LOA-008: {e}\n")
 
-    # If the brand is physical and passed all tests, explicitly say so rather than returning nothing.
+    # -------------------------------------------------------------------
+    # Proactive beyond-problem recommendations — these run on any brand
+    # with physical signals, regardless of whether defect checks fired,
+    # surfacing improvements that strengthen local AI discoverability.
+    # -------------------------------------------------------------------
+
+    # LOA-PRO-001: areaServed for geo/near-me queries
+    try:
+        has_area_served = False
+        for page in usable_pages:
+            json_lds = extract_json_ld(page["soup"])
+            for schema in json_lds:
+                if not isinstance(schema, dict):
+                    continue
+                if is_local_business(schema.get("@type")) and schema.get("areaServed"):
+                    has_area_served = True
+                    break
+            if has_area_served:
+                break
+
+        if has_local_business_anywhere and not has_area_served:
+            findings.append({
+                "id": "LOA-PRO-001",
+                "title": "Add areaServed to Capture 'Near Me' Queries",
+                "severity": "low",
+                "evidence": f"LocalBusiness schema was found but none of the {len(usable_pages)} sampled pages declare an areaServed property. AI assistants use areaServed to match businesses with location-based queries like 'shoe stores near me' or 'bakeries in downtown Austin'.",
+                "suggested_action": {
+                    "summary": "Add areaServed to your LocalBusiness JSON-LD with either a GeoCircle (for radius-based service areas), an AdministrativeArea (for city/state coverage), or a GeoShape (for delivery zones). Example: '\"areaServed\": {\"@type\": \"City\", \"name\": \"Austin, TX\"}'. This explicitly tells AI assistants which geographic queries your locations should match.",
+                    "priority": "medium"
+                }
+            })
+    except Exception as e:
+        sys.stderr.write(f"Error in LOA-PRO-001: {e}\n")
+
+    # LOA-PRO-002: Google Business Profile cross-linking via sameAs
+    try:
+        has_gbp_link = False
+        gbp_patterns = ["google.com/maps", "goo.gl/maps", "business.google.com", "maps.app.goo.gl"]
+        
+        for page in usable_pages:
+            json_lds = extract_json_ld(page["soup"])
+            for schema in json_lds:
+                if not isinstance(schema, dict):
+                    continue
+                if not is_local_business(schema.get("@type")):
+                    continue
+                same_as = schema.get("sameAs", [])
+                if isinstance(same_as, str):
+                    same_as = [same_as]
+                if isinstance(same_as, list):
+                    for link in same_as:
+                        if isinstance(link, str) and any(p in link.lower() for p in gbp_patterns):
+                            has_gbp_link = True
+                            break
+                if has_gbp_link:
+                    break
+            if has_gbp_link:
+                break
+
+        if has_local_business_anywhere and not has_gbp_link:
+            findings.append({
+                "id": "LOA-PRO-002",
+                "title": "Cross-Link LocalBusiness Schema With Google Business Profile",
+                "severity": "low",
+                "evidence": f"LocalBusiness schema was detected but none include a sameAs link to a Google Business Profile or Google Maps listing. Cross-linking establishes entity equivalence — AI assistants use sameAs to merge your website entity with your Google Maps listing, reviews, photos, and Q&A into a single knowledge graph node.",
+                "suggested_action": {
+                    "summary": "Add your Google Business Profile URL (the maps.app.goo.gl or google.com/maps link) to the sameAs array in your LocalBusiness JSON-LD. Also include official social profile URLs (Facebook, Instagram, Yelp). This creates a web of corroborating identity signals that AI assistants use to build confident, citation-rich answers about your business.",
+                    "priority": "medium"
+                }
+            })
+    except Exception as e:
+        sys.stderr.write(f"Error in LOA-PRO-002: {e}\n")
+
+    # LOA-PRO-003: potentialAction for voice-assistant direct actions
+    try:
+        has_action = False
+        for page in usable_pages:
+            json_lds = extract_json_ld(page["soup"])
+            for schema in json_lds:
+                if not isinstance(schema, dict):
+                    continue
+                if is_local_business(schema.get("@type")) and schema.get("potentialAction"):
+                    has_action = True
+                    break
+            if has_action:
+                break
+
+        if has_local_business_anywhere and not has_action:
+            findings.append({
+                "id": "LOA-PRO-003",
+                "title": "Add potentialAction for Voice-Assistant Direct Actions",
+                "severity": "low",
+                "evidence": f"LocalBusiness schema was detected but none declare potentialAction properties. Voice assistants (Google Assistant, Siri, Alexa) use potentialAction to enable hands-free actions like 'Reserve a table at [business]' or 'Order from [business]' directly from the search result.",
+                "suggested_action": {
+                    "summary": "Add potentialAction to your LocalBusiness JSON-LD. For restaurants: ReserveAction linking to your booking system. For retail: OrderAction linking to your online store. For services: a generic action linking to your appointment page. Example: '\"potentialAction\": {\"@type\": \"ReserveAction\", \"target\": {\"@type\": \"EntryPoint\", \"urlTemplate\": \"https://example.com/reserve\"}, \"result\": {\"@type\": \"Reservation\", \"name\": \"Table reservation\"}}'.",
+                    "priority": "low"
+                }
+            })
+    except Exception as e:
+        sys.stderr.write(f"Error in LOA-PRO-003: {e}\n")
+
+    # If the brand is physical and passed all tests (no defects AND no proactive recs fired),
+    # explicitly say so rather than returning nothing.
     if not findings:
         findings.append({
             "id": "LOA-PASS-001",

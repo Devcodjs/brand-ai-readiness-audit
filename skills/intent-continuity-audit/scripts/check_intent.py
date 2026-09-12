@@ -415,6 +415,125 @@ def check_ica_010(pages):
         }
     return None
 
+
+# ---------------------------------------------------------------------------
+# Proactive recommendations — beyond-problem suggestions that strengthen
+# on-site engagement and AI-referral continuity even where no explicit
+# defect was detected.
+# ---------------------------------------------------------------------------
+
+def proactive_search_action(pages):
+    """Recommend WebSite + SearchAction schema for AI sitelinks search box."""
+    has_search_action = False
+    for page in pages:
+        for script in page['soup'].find_all('script', type='application/ld+json'):
+            try:
+                text = script.string or ""
+                if "SearchAction" in text:
+                    has_search_action = True
+                    break
+            except Exception:
+                continue
+        if has_search_action:
+            break
+
+    if not has_search_action:
+        return {
+            "id": "ICA-PRO-001",
+            "title": "Add WebSite SearchAction Schema for AI Sitelinks",
+            "severity": "low",
+            "evidence": f"Scanned {len(pages)} pages; none declare a WebSite schema with SearchAction. AI assistants and search engines use SearchAction to offer a sitelinks search box directly in results, letting users jump to specific content without navigating the full site.",
+            "suggested_action": {
+                "summary": "Add a WebSite JSON-LD node on the homepage with a SearchAction that points to your site's internal search endpoint. Example: '{\"@type\": \"WebSite\", \"url\": \"https://example.com\", \"potentialAction\": {\"@type\": \"SearchAction\", \"target\": \"https://example.com/search?q={search_term_string}\", \"query-input\": \"required name=search_term_string\"}}'. This enables AI assistants to deep-link users into search results even when no direct page URL is available.",
+                "priority": "medium"
+            }
+        }
+    return None
+
+
+def proactive_faq_schema(pages):
+    """Recommend FAQPage schema for direct AI quoting."""
+    has_faq_schema = False
+    has_faq_content = False
+
+    for page in pages:
+        soup = page['soup']
+        # Check if FAQPage schema already exists
+        for script in soup.find_all('script', type='application/ld+json'):
+            try:
+                text = script.string or ""
+                if "FAQPage" in text:
+                    has_faq_schema = True
+                    break
+            except Exception:
+                continue
+
+        # Check if there's FAQ-like content (questions and answers pattern)
+        faq_patterns = re.compile(r'\b(faq|frequently asked|questions|q\s*&\s*a)\b', re.I)
+        url_lower = page['url'].lower()
+        page_text = soup.get_text(' ', strip=True)[:5000].lower()
+
+        if faq_patterns.search(url_lower) or faq_patterns.search(page_text):
+            has_faq_content = True
+
+        if has_faq_schema:
+            break
+
+    if not has_faq_schema:
+        evidence_detail = (
+            "FAQ-like content was detected but lacks FAQPage structured data"
+            if has_faq_content
+            else f"No FAQPage schema was found across {len(pages)} pages"
+        )
+        severity = "medium" if has_faq_content else "low"
+
+        return {
+            "id": "ICA-PRO-002",
+            "title": "Add FAQPage Schema to Increase AI Citation Rate",
+            "severity": severity,
+            "evidence": f"{evidence_detail}. AI assistants like ChatGPT and Perplexity preferentially quote content from pages with FAQPage structured data because the question-answer format maps directly to conversational Q&A — the exact interaction pattern of AI chat.",
+            "suggested_action": {
+                "summary": "Create or enhance a FAQ section using FAQPage JSON-LD schema. Each Q&A pair becomes a directly quotable answer for AI assistants. Structure your most common customer questions as FAQ schema entries — these are the queries AI users will ask. Even non-FAQ pages benefit from marking up common questions addressed in the content.",
+                "priority": severity
+            }
+        }
+    return None
+
+
+def proactive_smart_404(pages):
+    """Recommend a helpful 404 page for broken AI-generated deep links."""
+    # AI assistants sometimes generate URLs that don't exist on the target site
+    # (hallucinated deep links). A smart 404 page with search + popular links
+    # recovers these visitors instead of losing them.
+    has_custom_404 = False
+    has_search_on_404 = False
+
+    for page in pages:
+        soup = page['soup']
+        # Check if any page has a visible search form in the main content
+        # (we can't directly test the 404 page, but we can recommend it)
+        forms = soup.find_all('form')
+        for form in forms:
+            action = (form.get('action') or '').lower()
+            role = (form.get('role') or '').lower()
+            if 'search' in action or role == 'search':
+                has_custom_404 = True  # Site at least has search capability
+                break
+
+    if not has_custom_404:
+        return {
+            "id": "ICA-PRO-003",
+            "title": "Implement a Recovery-Oriented 404 Page for AI Deep Links",
+            "severity": "low",
+            "evidence": f"AI assistants occasionally generate or hallucinate URLs that don't exist on a site (e.g., /product/widget-xyz when the actual path is /products/widget-xyz-2025). When these links break, a default 404 page loses the visitor entirely.",
+            "suggested_action": {
+                "summary": "Build a custom 404 page that includes: (1) a prominent site search box so visitors can find what the AI was trying to link to, (2) links to your most popular categories and pages, and (3) suggested content based on the URL path keywords. This recovers visitors from broken AI-generated deep links instead of bouncing them.",
+                "priority": "low"
+            }
+        }
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
@@ -424,6 +543,7 @@ def main():
     pages = load_cached_pages(args.cache_dir)
     findings = []
     
+    # Defect detection checks
     checks = [
         check_ica_001, check_ica_002, check_ica_003, check_ica_004, check_ica_005,
         check_ica_006, check_ica_007, check_ica_008, check_ica_009, check_ica_010
@@ -439,7 +559,23 @@ def main():
             
     for i, finding in enumerate(findings):
         finding["id"] = f"ICA-{i+1:03d}"
-        
+
+    # Proactive beyond-problem recommendations — these run regardless of
+    # whether defects were found, surfacing improvements that strengthen
+    # AI-referral engagement even on already-passing pages.
+    proactive_checks = [
+        proactive_search_action,
+        proactive_faq_schema,
+        proactive_smart_404,
+    ]
+    for check in proactive_checks:
+        try:
+            finding = check(pages)
+            if finding:
+                findings.append(finding)
+        except Exception as e:
+            print(f"Proactive check {check.__name__} error: {e}", file=sys.stderr)
+
     print(json.dumps(findings, indent=2))
     sys.exit(0)
 

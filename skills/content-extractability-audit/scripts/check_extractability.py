@@ -387,6 +387,110 @@ def check_cea_009(pages):
         }
     return None
 
+
+# ---------------------------------------------------------------------------
+# Proactive recommendations — beyond-problem suggestions that strengthen AI
+# extractability even where no explicit defect was detected.
+# ---------------------------------------------------------------------------
+
+def proactive_speakable_schema(pages):
+    """Recommend speakable schema markup for voice-assistant quoting."""
+    has_speakable = False
+    for page in pages:
+        for script in page["soup"].find_all("script", type="application/ld+json"):
+            if script.string and "speakable" in script.string.lower():
+                has_speakable = True
+                break
+        if has_speakable:
+            break
+
+    if not has_speakable:
+        return {
+            "id": "CEA-PRO-001",
+            "title": "Add Speakable Schema for Voice-Assistant Quoting",
+            "severity": "low",
+            "evidence": f"Scanned {len(pages)} pages; none declare schema.org/speakable markup. Voice assistants (Google Assistant, Alexa) use speakable to identify which sections of a page are best suited for text-to-speech readout.",
+            "suggested_action": {
+                "summary": "Add speakable property to your WebPage or Article JSON-LD, pointing at CSS selectors for headline and summary sections. Example: '\"speakable\": {\"@type\": \"SpeakableSpecification\", \"cssSelector\": [\".article-headline\", \".article-summary\"]}'. This makes your content eligible for voice-assistant answers and audio news briefings.",
+                "priority": "medium"
+            }
+        }
+    return None
+
+
+def proactive_figure_figcaption(pages):
+    """Recommend wrapping informational images in <figure> + <figcaption>."""
+    total_content_images = 0
+    images_in_figure = 0
+
+    for page in pages:
+        content_area = get_content_area(page["soup"])
+        images = content_area.find_all("img")
+        for img in images:
+            # Skip tiny tracking pixels
+            width = img.get("width")
+            height = img.get("height")
+            if width and width.isdigit() and int(width) < 5:
+                continue
+            if height and height.isdigit() and int(height) < 5:
+                continue
+            src = img.get("src", "")
+            if any(x in src.lower() for x in ["spacer", "pixel", "blank", "1x1"]):
+                continue
+            if src.startswith("data:image") and len(src) < 100:
+                continue
+
+            total_content_images += 1
+            if img.find_parent("figure"):
+                images_in_figure += 1
+
+    if total_content_images > 0:
+        pct_in_figure = round((images_in_figure / total_content_images) * 100, 1)
+        if pct_in_figure < 50:
+            return {
+                "id": "CEA-PRO-002",
+                "title": "Wrap Content Images in <figure> With <figcaption>",
+                "severity": "low",
+                "evidence": f"Only {images_in_figure}/{total_content_images} ({pct_in_figure}%) content images across {len(pages)} pages are wrapped in a <figure> element. AI systems use <figcaption> text as a structured, high-confidence description of what an image shows — stronger than alt text alone.",
+                "suggested_action": {
+                    "summary": "Wrap key informational images in <figure> with a <figcaption> that describes the image's informational content in a complete sentence. This gives AI assistants a machine-readable caption to cite alongside the image, improving both extractability and citation accuracy. Example: '<figure><img src=\"...\" alt=\"...\"><figcaption>Quarterly revenue growth showing 23% YoY increase</figcaption></figure>'.",
+                    "priority": "low"
+                }
+            }
+    return None
+
+
+def proactive_data_nosnippet(pages):
+    """Recommend checking for data-nosnippet attributes that silently block AI quoting."""
+    nosnippet_count = 0
+    affected_urls = set()
+
+    for page in pages:
+        content_area = get_content_area(page["soup"])
+        # data-nosnippet prevents Google (and AI assistants using Google's index)
+        # from using any text inside that element as a featured snippet or quote.
+        elements = content_area.find_all(attrs={"data-nosnippet": True})
+        for el in elements:
+            text_len = len(el.get_text(strip=True))
+            if text_len > 50:  # Only flag substantive content blocks
+                nosnippet_count += 1
+                affected_urls.add(page["url"])
+
+    if nosnippet_count > 0:
+        urls = list(affected_urls)[:3]
+        return {
+            "id": "CEA-PRO-003",
+            "title": "Content Blocks Marked data-nosnippet Suppress AI Quoting",
+            "severity": "medium",
+            "evidence": f"Found {nosnippet_count} substantive content element(s) with the data-nosnippet attribute across {len(pages)} pages. This HTML attribute prevents search engines and AI assistants from quoting that text in results or citations. Pages: [{', '.join(urls)}].",
+            "suggested_action": {
+                "summary": "Review data-nosnippet usage and remove it from content sections you want AI assistants to cite. Reserve data-nosnippet only for sensitive information (e.g., phone numbers, addresses you don't want in featured snippets). Substantive informational content should remain quotable.",
+                "priority": "medium"
+            }
+        }
+    return None
+
+
 def run_audit(url, cache_dir):
     pages = load_cached_pages(cache_dir)
     if not pages:
@@ -398,7 +502,7 @@ def run_audit(url, cache_dir):
     ]
 
     findings = []
-    # Added check_cea_009 to the array
+    # Defect detection checks
     checks = [check_cea_001, check_cea_002, check_cea_003, check_cea_004, 
               check_cea_005, check_cea_006, check_cea_007, check_cea_008, check_cea_009]
     
@@ -410,11 +514,11 @@ def run_audit(url, cache_dir):
         except Exception as e:
             sys.stderr.write(f"Check {idx+1} failed: {e}\n")
 
-    # Rename IDs sequentially
+    # Rename defect IDs sequentially
     for i, finding in enumerate(findings):
         finding["id"] = f"CEA-{i+1:03d}"
 
-    # Fallback info finding if everything passes
+    # Fallback info finding if no defects were found
     if not findings:
         findings.append({
             "id": "CEA-PASS-000",
@@ -423,7 +527,23 @@ def run_audit(url, cache_dir):
             "evidence": f"Scanned {len(usable_pages)} pages and found no missing product schemas, inaccessible SVGs, uncaptioned media, or JS-locked content blocks.",
             "suggested_action": None
         })
-        
+
+    # Proactive beyond-problem recommendations — these run regardless of
+    # whether defects were found, surfacing improvements that strengthen
+    # AI extractability even on already-passing pages.
+    proactive_checks = [
+        proactive_speakable_schema,
+        proactive_figure_figcaption,
+        proactive_data_nosnippet,
+    ]
+    for check in proactive_checks:
+        try:
+            finding = check(usable_pages)
+            if finding:
+                findings.append(finding)
+        except Exception as e:
+            sys.stderr.write(f"Proactive check {check.__name__} failed: {e}\n")
+
     print(json.dumps(findings, indent=2))
 
 if __name__ == "__main__":
