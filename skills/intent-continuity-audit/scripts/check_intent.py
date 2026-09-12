@@ -105,8 +105,7 @@ def check_ica_001(pages: list) -> dict | None:
             "suggested_action": {
                 "summary": (
                     "Full-viewport overlays obstruct automated parsers from reading initial text. "
-                    "If these elements do not dynamically bypass verified AI crawlers server-side, "
-                    "ensure critical informational content remains accessible in the raw server HTML."
+                    "If removing the marketing pop-up isn't an option, configure your edge router (e.g., Cloudflare Workers) or server-side middleware to suppress the overlay component specifically when the user-agent matches a verified AI bot."
                 ),
                 "priority": severity
             }
@@ -147,7 +146,7 @@ def check_ica_002(pages: list) -> dict | None:
             "severity": severity,
             "evidence": f"Pages average {avg:.1f} deep-linkable section anchors. {low_anchor_pages}/{len(pages)} sampled routes contain fewer than 2 targetable heading IDs.",
             "suggested_action": {
-                "summary": "Provide descriptive 'id' attributes on primary headings so AI agents can deep-link users directly to cited answers.",
+                "summary": "Configure your CMS, Markdown renderer, or rich-text editor to automatically generate id attributes from heading text (auto-slugging). This instantly enables deep-linking site-wide without manual data entry.",
                 "priority": severity
             }
         }
@@ -271,7 +270,7 @@ def check_ica_005(pages: list) -> dict | None:
             "severity": severity,
             "evidence": f"{dup_count}/{len(pages)} sampled routes share duplicate <title> tags. {missing}/{len(pages)} lack titles entirely.",
             "suggested_action": {
-                "summary": "Provide unique, context-rich <title> tags on every distinct path to avoid citation ambiguity in AI conversational engines.",
+                "summary": "Update your global <Head> component or SEO plugin to automatically generate titles and meta descriptions using dynamic variables (e.g., {{Product Name}} | {{Brand}}), and fallback to the first paragraph of text for the summary.",
                 "priority": severity
             }
         }

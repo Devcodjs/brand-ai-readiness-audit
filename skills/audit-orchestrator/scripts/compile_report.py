@@ -233,40 +233,14 @@ def _eligible_skills(checks, meta: dict, pages: list[dict]) -> tuple[list[tuple[
     recovered_note = _recovered_paths_note(pages)
 
     evidence_notes = []
-
-    # 1. Site Typology Classification (Context-Aware Routing)
-    page_counts = meta.get("page_type_counts", {})
-    has_commerce = page_counts.get("product", 0) > 0 or page_counts.get("category", 0) > 0
-    has_local = page_counts.get("location", 0) > 0
-    is_informational = not has_commerce and not has_local
-
-    filtered_checks = []
-    for check in checks:
-        skill_name = check[0]
-        
-        # Suppress physical local-business checks for purely digital/informational sites
-        if is_informational and skill_name == "local-omnichannel-audit":
-            evidence_notes.append({
-                "id": "TYPOLOGY-SUPPRESS-LOCAL",
-                "title": "Local Audit Suppressed (Informational Site)",
-                "severity": "info",
-                "evidence": "Site classified as Informational/Media (0 product, category, or location pages detected). Local business footprint checks were disabled to prevent false positives.",
-                "suggested_action": None,
-                "skill": "audit-orchestrator",
-            })
-            continue
-            
-        filtered_checks.append(check)
-
-    # 2. WAF & Evidence Quality Logic
     if challenge_pages:
         evidence_notes.append({
             "id": "CRAWL-DATA-QUALITY",
             "title": "Crawl Evidence Quality Reduced by Challenge Responses",
             "severity": "medium" if usable_pages else "high",
             "evidence": (
-                f"{challenge_pages} sampled pages returned security challenges; "
-                f"{usable_pages} pages were normal HTML "
+                f"{challenge_pages} sampled page(s) returned security challenges; "
+                f"{usable_pages} page(s) were normal HTML "
                 f"(usable-page ratio {usable_ratio:.0%})."
                 + recovered_note
             ),
@@ -282,14 +256,14 @@ def _eligible_skills(checks, meta: dict, pages: list[dict]) -> tuple[list[tuple[
             "skill": "audit-orchestrator",
         })
 
-    if usable_pages == 0 or usable_ratio < 0.40:
-        selected = [c for c in filtered_checks if c[0] in ALWAYS_SAFE_SKILLS]
+    if usable_pages < 3 and usable_ratio < 0.40:
+        selected = [c for c in checks if c[0] in ALWAYS_SAFE_SKILLS]
         evidence_notes.append({
             "id": "CRAWL-SUPPRESS-001",
             "title": "Page-Level Audits Suppressed Due to Insufficient Evidence",
             "severity": "medium",
             "evidence": (
-                f"Only {usable_pages} of {meta.get('pages_requested', 0)} sampled pages were normal HTML; "
+                f"Only {usable_pages} of {meta.get('pages_requested', 0)} sampled page(s) were normal HTML; "
                 "page-dependent checks were suppressed to avoid false positives."
                 + recovered_note
             ),
@@ -305,7 +279,7 @@ def _eligible_skills(checks, meta: dict, pages: list[dict]) -> tuple[list[tuple[
         })
         return selected, evidence_notes
 
-    return filtered_checks, evidence_notes
+    return list(checks), evidence_notes
 
 
 def _dedupe_findings(findings: list[dict]) -> list[dict]:

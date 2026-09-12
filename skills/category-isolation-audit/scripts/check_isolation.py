@@ -210,7 +210,6 @@ def choose_category_pages(pages: list[dict]) -> tuple[list[dict], list[dict], di
         classification = str(page.get("content_classification") or "").lower().strip()
         page_url = page.get("final_url") or page.get("url", "unknown")
         
-        # Explicit bypass for challenge and blocked pages
         if classification in {"blocked", "bot_challenge", "challenge", "auth_wall", "access_denied", "captcha"}:
             rejected.append({"url": page_url, "reason": f"crawler classified as {classification}"})
             continue
@@ -287,12 +286,11 @@ def run_audit(url: str, cache_dir: str = "audit-cache") -> list:
             "title": "Not Enough Category Pages to Audit Isolation",
             "severity": "info",
             "evidence": (
-                f"Found {detection_stats['candidate_count']} usable category candidate(s) after combining the crawler's "
-                f"page_type with URL and page-structure signals; at least 2 are needed to compare category boundaries. "
+                f"Found {detection_stats['candidate_count']} usable category candidate(s); at least 2 are needed to compare category boundaries. "
                 f"Reason: {reason_text}."
             ),
             "suggested_action": {
-                "summary": "Crawl more representative category/collection URLs or improve page classification. This result is an evidence limitation, not evidence that category isolation is healthy or unhealthy.",
+                "summary": "Ensure your category landing pages are distinct from product templates and accessible to crawlers.",
                 "priority": "low",
             },
         }]
@@ -309,35 +307,36 @@ def run_audit(url: str, cache_dir: str = "audit-cache") -> list:
             "severity": "info",
             "evidence": (
                 f"The crawler explicitly classified {detection_stats['manifest_category_count']} usable page(s) as category/collection, "
-                f"while {detection_stats['fallback_category_count']} additional category candidate(s) were recovered from URL and page-structure evidence. "
+                f"while {detection_stats['fallback_category_count']} additional candidate(s) were recovered via heuristics. "
                 f"Examples: {', '.join(fallback_urls[:5])}."
             ),
-            "suggested_action": {
-                "summary": "Keep the fallback detection enabled and improve the crawler's page-type classifier so category/collection pages are labeled consistently across sites.",
-                "priority": "low",
-            },
+            "suggested_action": None,
         })
 
+    # 1. Thin Copy
     thin_pages = [
         c for c in category_pages
         if c["signals"]["word_count"] < THIN_COPY_WORD_THRESHOLD
         and len(c["signals"]["product_links"]) >= MIN_PRODUCT_LINKS_FOR_GRID
     ]
     if thin_pages:
+        ratio = len(thin_pages) / len(category_pages)
+        severity = "high" if ratio > 0.6 else "medium"
         examples = "; ".join(
-            f"{c['signals']['url']} ({c['signals']['word_count']} descriptive words, {len(c['signals']['product_links'])} product links)"
-            for c in thin_pages[:5]
+            f"{c['signals']['url']} ({c['signals']['word_count']} words)"
+            for c in thin_pages[:3]
         )
         add_finding(
             findings,
             "CIA-THIN-001",
             "Category Pages Have Little Descriptive Copy",
-            "medium",
-            f"{len(thin_pages)}/{len(category_pages)} detected category pages have fewer than {THIN_COPY_WORD_THRESHOLD} descriptive words while exposing a product grid. Examples: {examples}.",
-            "Add concise, category-specific explanatory copy that states what the collection contains and the primary user intent it serves. Keep the product grid, but expose the category meaning as readable HTML text.",
-            "medium",
+            severity,
+            f"{len(thin_pages)}/{len(category_pages)} category pages have fewer than {THIN_COPY_WORD_THRESHOLD} descriptive words while exposing a product grid. Examples: {examples}.",
+            "If manually writing copy for thousands of collections is unfeasible, use your PIM (Product Information Management) data or an automated pipeline to dynamically inject short, keyword-rich category descriptions.",
+            severity,
         )
 
+    # 2. Duplicate Copy
     comparable = [
         c for c in category_pages
         if c["signals"]["word_count"] >= THIN_COPY_WORD_THRESHOLD
@@ -348,25 +347,28 @@ def run_audit(url: str, cache_dir: str = "audit-cache") -> list:
         nb = normalize_text_for_similarity(b["signals"]["desc_text"])
         if not na or not nb:
             continue
-        ratio = SequenceMatcher(None, na, nb).ratio()
-        if ratio >= DUPLICATE_SIMILARITY_THRESHOLD:
-            high_sim_pairs.append((a, b, ratio))
+        sim_ratio = SequenceMatcher(None, na, nb).ratio()
+        if sim_ratio >= DUPLICATE_SIMILARITY_THRESHOLD:
+            high_sim_pairs.append((a, b, sim_ratio))
 
     if high_sim_pairs:
+        # Dynamic Severity based on widespread duplication
+        severity = "high" if len(high_sim_pairs) > (len(category_pages) // 2) else "medium"
         examples = "; ".join(
-            f"{a['signals']['url']} vs {b['signals']['url']} ({ratio:.0%})"
-            for a, b, ratio in high_sim_pairs[:5]
+            f"{a['signals']['url']} vs {b['signals']['url']} ({sim_ratio:.0%})"
+            for a, b, sim_ratio in high_sim_pairs[:3]
         )
         add_finding(
             findings,
             "CIA-OVERLAP-002",
             "Category Pages Use Near-Duplicate Descriptive Copy",
-            "medium",
-            f"{len(high_sim_pairs)} category-page pair(s) exceed {DUPLICATE_SIMILARITY_THRESHOLD:.0%} normalized text similarity. Examples: {examples}.",
-            "Write unique category-specific copy for each collection. Keep shared brand language short, but make the category's scope, audience, products, and intent explicit so an AI classifier can distinguish sibling collections.",
-            "medium",
+            severity,
+            f"{len(high_sim_pairs)} category-page pair(s) exceed {DUPLICATE_SIMILARITY_THRESHOLD:.0%} text similarity. Templated boilerplate dilutes AI relevance. Examples: {examples}.",
+            "If these are overlapping utility facets (e.g., 'all-shirts' vs 'all-tops'), use canonical tags or noindex directives to consolidate them. For distinct categories, use dynamic templates that pull unique attributes from your CMS to differentiate them.",
+            severity,
         )
 
+    # 3. Heavy Cross-Listing
     product_to_cats = defaultdict(set)
     for c in category_pages:
         for link in c["signals"]["product_links"]:
@@ -381,7 +383,7 @@ def run_audit(url: str, cache_dir: str = "audit-cache") -> list:
         share = len(cross_listed) / len(product_to_cats)
         if share >= CROSS_LIST_MIN_SHARE:
             sample_product, sample_cats = max(cross_listed.items(), key=lambda x: len(x[1]))
-            severity = "medium"
+            severity = "high" if share > 0.8 else "medium"
             add_finding(
                 findings,
                 "CIA-CROSSLIST-003",
@@ -389,10 +391,10 @@ def run_audit(url: str, cache_dir: str = "audit-cache") -> list:
                 severity,
                 (
                     f"{len(cross_listed)}/{len(product_to_cats)} distinct product URLs ({share:.0%}) detected in the sampled category grids "
-                    f"appear in at least {CROSS_LIST_MIN_CATEGORIES} categories. Example: {sample_product} appears in {len(sample_cats)} categories: {sorted(sample_cats)}."
+                    f"appear in at least {CROSS_LIST_MIN_CATEGORIES} categories. Example: {sample_product} appears in {len(sample_cats)} categories."
                 ),
-                "Keep cross-listing where it matches genuine merchandising intent, but add category-specific framing and tighten category membership when the same inventory dominates otherwise distinct collections.",
-                "medium",
+                "If inventory naturally overlaps heavily (e.g., size or color filters acting as URLs), convert these facet routes into URL parameters (e.g., ?color=red) that canonicalize to the parent category. This tightens AI indexing and prevents semantic cannibalization.",
+                severity,
             )
 
     if not findings:
@@ -401,11 +403,11 @@ def run_audit(url: str, cache_dir: str = "audit-cache") -> list:
             "title": "Category Boundaries Show No Strong Isolation Signal",
             "severity": "info",
             "evidence": (
-                f"Checked {len(category_pages)} detected category/collection pages using descriptive-copy, similarity, and product-overlap signals. "
-                "No configured threshold was exceeded."
+                f"Checked {len(category_pages)} detected category/collection pages. "
+                "Descriptive-copy, similarity, and product-overlap metrics all remain within healthy thresholds."
             ),
             "suggested_action": {
-                "summary": "Keep category names, introductory copy, internal links, and product membership specific to each user intent; continue monitoring as the information architecture changes.",
+                "summary": "Your information architecture handles category boundaries well. Continue enforcing canonicalization policies as new facets and product lines are introduced.",
                 "priority": "low",
             },
         })

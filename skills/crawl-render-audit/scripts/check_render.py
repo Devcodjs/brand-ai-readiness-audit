@@ -33,10 +33,16 @@ AI_BOTS = [
     "ChatGPT-User", "CCBot", "Bytespider", "Amazonbot", "meta-externalagent",
     "Grok",
 ]
-HIGH_PRIORITY_BOTS = {
-    "OAI-SearchBot", "ChatGPT-User", "PerplexityBot", "ClaudeBot",
-    "Claude", "Claude-SearchBot", "GPTBot", "Gemini", "Grok",
-}
+
+# Pure AI Discoverability & Search Agents (No Foundation Model Training Scrapers)
+DISCOVERABILITY_BOTS = [
+    "OAI-SearchBot",      # ChatGPT Search Indexing
+    "ChatGPT-User",       # ChatGPT Live Web Browsing fetches
+    "Claude-SearchBot",   # Anthropic Search Indexing
+    "Claude-User",        # Anthropic Live Web Browsing fetches
+    "PerplexityBot",      # Perplexity AI Search
+    "Grok",               # xAI Search
+]
 
 # Render-delta severity tiers: (min_ratio, severity)
 RENDER_DELTA_TIERS = [(0.70, "high"), (0.30, "medium")]
@@ -206,7 +212,7 @@ def robots_findings(target_url: str, cache_dir: str) -> tuple[list[str], dict]:
         parser = urllib.robotparser.RobotFileParser()
         parser.parse(robots_path.read_text(encoding="utf-8").splitlines())
         meta["robots_checked"] = True
-        for bot in AI_BOTS:
+        for bot in DISCOVERABILITY_BOTS:
             if not parser.can_fetch(bot, target_url):
                 blocked.append(bot)
     except Exception:

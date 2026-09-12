@@ -93,12 +93,74 @@ def extract_text(element):
         tag.decompose()
     return el_copy.get_text(separator=" ", strip=True)
 
+def is_reference_or_wiki_page(soup, url):
+    """
+    Positive-evidence check for encyclopedic/reference platforms (Wikipedia and
+    the broader MediaWiki ecosystem it anchors). Deliberately separate from the
+    physical_signals gate below: that gate reasons from *absence* of business
+    signals, which needs a representative sample to trust. This one reasons from
+    *presence* of a specific, reliable platform marker, so a single matching page
+    anywhere in the sample is sufficient regardless of crawl quality elsewhere.
+    Kept narrow on purpose - it should only fire on real reference platforms, not
+    softly infer "this seems editorial" from content.
+    """
+    url_lower = (url or "").lower()
+    reference_domains = [
+        "wikipedia.org", "wikimedia.org", "wiktionary.org", "wikibooks.org",
+        "wikiquote.org", "wikisource.org", "wikidata.org", "wikivoyage.org",
+    ]
+    if any(d in url_lower for d in reference_domains):
+        return True
+
+    # MediaWiki generator meta tag - used by Wikipedia itself and by thousands of
+    # independently-run wikis (Fandom, internal knowledge bases, fan wikis, etc.)
+    generator = soup.find("meta", attrs={"name": "generator"})
+    if generator:
+        content = (generator.get("content") or "").lower()
+        if "mediawiki" in content:
+            return True
+
+    body = soup.find("body")
+    if body:
+        body_classes = " ".join(body.get("class", [])).lower()
+        if "mediawiki" in body_classes:
+            return True
+
+    return False
+
 def run_checks(pages):
     findings = []
     usable_pages = [p for p in pages if p.get("content_classification") == "normal"]
 
     if not usable_pages:
+        if pages:
+            return [{
+                "id": "LOA-SKIP-NO-USABLE-PAGES",
+                "title": "Local Audit Skipped (No Usable Pages)",
+                "severity": "info",
+                "evidence": f"{len(pages)} pages were sampled but 0 had content_classification == 'normal'; local omnichannel checks require readable page content and were not run.",
+                "suggested_action": None,
+                "skill": "local-omnichannel-audit",
+            }]
         return findings
+
+    # --- 0. GATE CHECK: Is this a reference/wiki platform? ---
+    # Runs before any signal scanning - a positive platform match is decisive on
+    # its own and shouldn't be weighed against (or overridden by) a stray map
+    # embed on some article page.
+    reference_page = next(
+        (p for p in usable_pages if is_reference_or_wiki_page(p["soup"], p["url"])),
+        None
+    )
+    if reference_page:
+        return [{
+            "id": "LOA-SKIP-REFERENCE-SITE",
+            "title": "Local Audit Skipped (Reference/Wiki Site Detected)",
+            "severity": "info",
+            "evidence": f"Detected reference/wiki platform markers (e.g. {reference_page['url']} - MediaWiki generator tag or a wikipedia/wikimedia-family domain). Local omnichannel checks do not apply to encyclopedic/reference content and were skipped.",
+            "suggested_action": None,
+            "skill": "local-omnichannel-audit",
+        }]
 
     # --- 1. GATE CHECK: Does this brand have a physical footprint? ---
     physical_signals = []
@@ -148,6 +210,16 @@ def run_checks(pages):
             "evidence": "No physical retail signals (e.g., PostalAddress schema, map embeds, 'store locator' links) were detected across sampled pages. Assuming pure e-commerce or digital footprint; local omnichannel SEO audits bypassed to prevent false positives.",
             "suggested_action": None
         }]
+
+    # A bare map embed with nothing else corroborating it (no schema, no locator
+    # widget, no retail nav text) is real evidence but lower-confidence - it could
+    # also be a reference/editorial page that happens to embed a map (e.g. a wiki
+    # article about a place). Don't suppress on this basis (a real business with a
+    # sloppy implementation can look identical), just soften severity downstream.
+    weak_evidence = physical_signals == ["Embedded Map"]
+
+    def downgrade_severity(severity):
+        return {"critical": "high", "high": "medium", "medium": "low", "low": "low"}.get(severity, severity)
 
     lb_page_count = 0
     postal_address_findings = []
@@ -211,6 +283,10 @@ def run_checks(pages):
                 severity = "high" if ratio < 0.3 else "medium"
                 title = "Sparse LocalBusiness Schema Coverage"
                 evidence_text = f"LocalBusiness schema found, but only on {lb_page_count}/{len(usable_pages)} pages. Incomplete coverage limits AI confidence."
+
+            if weak_evidence:
+                severity = downgrade_severity(severity)
+                evidence_text += " Note: the only physical-footprint signal found sitewide is a bare embedded map with no corroborating schema, locator widget, or retail navigation - confirm this is a business page and not reference/editorial content before treating as high-confidence."
 
             findings.append({
                 "id": "LOA-001",
@@ -317,11 +393,17 @@ def run_checks(pages):
 
         if map_without_address:
             severity = "high" if len(map_without_address) > 1 else "medium"
+            evidence_text = f"Found map embeds on {len(map_without_address)} page(s) (e.g. {map_without_address[0]}) but no visible street address in HTML text. Addresses locked inside iframes are invisible to AI."
+
+            if weak_evidence:
+                severity = downgrade_severity(severity)
+                evidence_text += " Note: this map embed is the only physical-footprint signal found sitewide - confirm this is a business location page and not a reference/editorial page before treating as high-confidence."
+
             findings.append({
                 "id": "LOA-005",
                 "title": "Address Not in HTML Text",
                 "severity": severity,
-                "evidence": f"Found map embeds on {len(map_without_address)} page(s) (e.g. {map_without_address[0]}) but no visible street address in HTML text. Addresses locked inside iframes are invisible to AI.",
+                "evidence": evidence_text,
                 "suggested_action": {
                     "summary": "Display full street address as visible HTML text alongside map embeds. Use the <address> element.",
                     "priority": severity
@@ -372,7 +454,7 @@ def run_checks(pages):
                     "severity": severity,
                     "evidence": f"Found {len(set(page_phones.values()))} conflicting semantic phone links (tel:) across pages. Example: '{first_phone}' on {first_url} vs '{inconsistent_phone}' on {inconsistent_url}.",
                     "suggested_action": {
-                        "summary": "Standardize your primary contact number across all 'tel:' links and footer elements to ensure AI agents do not surface conflicting contact info.",
+                        "summary": "Centralize your NAP (Name, Address, Phone) data in a single global configuration file or CMS variable. Reference this single variable in your header and footer components to instantly eliminate contact drift across the site.",
                         "priority": severity
                     }
                 })
@@ -414,14 +496,21 @@ def run_checks(pages):
                 break
 
         if not has_contact_page:
+            severity = "high"
+            evidence_text = f"Physical brand footprint detected ({', '.join(physical_signals)}), but scanned {len(usable_pages)} pages/links and found no dedicated location page."
+
+            if weak_evidence:
+                severity = downgrade_severity(severity)
+                evidence_text += " Note: the only physical-footprint signal found sitewide is a bare embedded map - confirm this site represents a physical business before treating as high-confidence."
+
             findings.append({
                 "id": "LOA-007",
                 "title": "No Omnichannel Location Page",
-                "severity": "high",
-                "evidence": f"Physical brand footprint detected ({', '.join(physical_signals)}), but scanned {len(usable_pages)} pages/links and found no dedicated location page.",
+                "severity": severity,
+                "evidence": evidence_text,
                 "suggested_action": {
                     "summary": "Create a dedicated /locations page with NAP, hours, and map. Link prominently from site navigation.",
-                    "priority": "high"
+                    "priority": severity
                 }
             })
     except Exception as e:
@@ -462,7 +551,7 @@ def run_checks(pages):
                 "severity": "high",
                 "evidence": f"Found store locator widget ('{js_locked['selector']}') on {js_locked['url']} containing only {js_locked['chars']} chars of text in static HTML. Store locations require JavaScript.",
                 "suggested_action": {
-                    "summary": "Server-render the list of store names, addresses, and phone numbers as HTML text. Client-side interactivity can enhance but baseline data must be in initial HTML.",
+                    "summary": "If rewriting an interactive, client-side store locator to SSR is too expensive, simply inject a static LocalBusiness JSON-LD array containing your store details into the <head> of the page. This satisfies AI crawlers cheaply without changing the UI.",
                     "priority": "high"
                 }
             })

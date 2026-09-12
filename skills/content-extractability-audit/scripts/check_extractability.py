@@ -202,7 +202,7 @@ def check_cea_003(pages: list) -> dict | None:
             "severity": severity,
             "evidence": f"Found {svg_count} SVG elements in content areas lacking <title>, <desc>, <text>, or ARIA labels across {len(affected_urls)} pages.",
             "suggested_action": {
-                "summary": "Add <title> and <desc> elements inside each informational SVG. For icons, add aria-label. For decorative SVGs, add aria-hidden='true'.",
+                "summary": "If these SVGs are decorative UI elements (which is most common), globally adding aria-hidden='true' to your base icon component will instantly resolve this. If they are informational charts, provide <title> and <desc> tags so AI parsers can read them.",
                 "priority": severity
             }
         }
@@ -242,7 +242,7 @@ def check_cea_004(pages: list) -> dict | None:
             "severity": severity,
             "evidence": f"Found {media_count} video/audio elements across {len(affected_urls)} pages without <track> captions or adjacent transcript links.",
             "suggested_action": {
-                "summary": "Add WebVTT caption tracks (<track kind='captions'>) to all video and audio elements. Provide a text transcript link adjacent to embedded media.",
+                "summary": "Add WebVTT caption tracks (<track kind='captions'>) to all video and audio elements. Provide a text transcript link adjacent to embedded media. If manual captioning isn't feasible, integrate an automated transcription API into your media upload pipeline, or simply output a machine-readable text summary in an accordion immediately below the player.",
                 "priority": severity
             }
         }
@@ -324,7 +324,7 @@ def check_cea_006(pages: list) -> dict | None:
             "severity": severity,
             "evidence": f"Found {iframe_count} external iframes. {missing_title} lack a title attribute, making their content opaque to crawlers. Affected pages: {len(affected_urls)}. Sources: [{', '.join(domain_list)}]",
             "suggested_action": {
-                "summary": "Add descriptive title attributes to all iframes. Where possible, provide key content from the iframe as native HTML text on the host page.",
+                "summary": "Update your base <Embed/> or <VideoPlayer/> wrapper component to accept and automatically apply a title prop to the underlying <iframe>. This resolves the issue globally for all future content. For existing iframes, add a descriptive title attribute that explains the embedded content (e.g., 'Product Demo Video', 'Interactive Map of Locations').",
                 "priority": severity
             }
         }
@@ -455,7 +455,7 @@ def proactive_speakable_schema(pages: list) -> dict | None:
         return {
             "id": "CEA-PRO-001",
             "title": "Add Speakable Schema for Voice-Assistant Quoting",
-            "severity": "low",
+            "severity": "info",
             "evidence": f"Scanned {len(pages)} pages; none declare schema.org/speakable markup. Voice assistants use speakable to identify which sections of a page are best suited for text-to-speech readout.",
             "suggested_action": {
                 "summary": "Add speakable property to your WebPage or Article JSON-LD, pointing at CSS selectors for headline and summary sections. This makes your content eligible for audio news briefings.",
