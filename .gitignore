@@ -1,3 +1,5 @@
 __pycache__/
 *.py[cod]
-audit-cache
+audit-cache/
+venv/
+.env
