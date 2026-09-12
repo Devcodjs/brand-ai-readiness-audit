@@ -67,6 +67,31 @@ PAGE_TYPE_HINTS = (
     ("article", ("/article/", "/blog/", "/news/", "/stories/", "/help/", "/learn/")),
 )
 
+# --- Subdomain-pivot tuning ---
+# Subdomains that host assets/infra rather than crawlable site content.
+# Even if one of these clusters more heavily than the real content
+# subdomain (e.g. a CDN referenced on every page), it's never the right
+# pivot target, so it's excluded before any counting happens.
+INFRA_SUBDOMAIN_LABELS = {
+    "cdn", "static", "assets", "img", "images", "media", "api",
+    "accounts", "account", "login", "auth", "sso", "help", "support",
+    "status", "mail", "email", "cache", "edge", "ajax",
+}
+# Below this many same-subdomain links, a homepage is treated as too thin
+# to represent real site content on its own (a routing/portal page).
+# NOTE: this gate only applies to the "dominant cluster" pattern below -
+# see the ordering comment inside _evaluate_subdomain_pivot for why the
+# diffuse fan-out pattern must be checked BEFORE this gate, not after it.
+MIN_SELF_LINKS_TO_SKIP_PIVOT = 3
+# A single other subdomain clearly "wins" once it has this many links -
+# the classic blog.example.com / shop.example.com case.
+DOMINANT_CLUSTER_MIN_LINKS = 3
+# A portal that fans out to many DIFFERENT subdomains, each with only one
+# or two links (e.g. Wikipedia's ~300 language editions), is just as real
+# a signal even though no single one hits DOMINANT_CLUSTER_MIN_LINKS -
+# what matters there is breadth of distinct subdomains, not depth of any one.
+MIN_DISTINCT_SUBDOMAINS_FOR_FANOUT = 5
+
 def find_repository_root() -> Path:
     """Find the marketplace root without relying on a fixed directory depth."""
     here = Path(__file__).resolve()
@@ -181,6 +206,7 @@ class SiteCrawler:
         self.robot_parser = urllib.robotparser.RobotFileParser()
         self.robot_parser.set_url(f"{self.domain_root}/robots.txt")
         self.crawl_delay = 0.0
+        self.last_pivot_diagnostics = None
 
     def reset_cache_dir(self):
         if CACHE_DIR.exists():
@@ -188,6 +214,18 @@ class SiteCrawler:
         PAGES_DIR.mkdir(parents=True, exist_ok=True)
 
     def fetch_and_parse_robots(self) -> dict:
+        # Always parse into a FRESH parser. urllib.robotparser's internal
+        # _add_entry() keeps the *first* "User-agent: *" block it ever sees
+        # on a given instance ("the first default entry wins") and silently
+        # drops later ones. Since this method is called a second time after
+        # a subdomain pivot (see build_cache), reusing self.robot_parser
+        # would leave every is_allowed()/crawl_delay() check still running
+        # against the ORIGINAL domain's robots.txt instead of the pivoted
+        # target's - a real robots.txt-compliance bug, not just a stale-data
+        # one. A fresh instance per call makes this method safe to re-run.
+        self.robot_parser = urllib.robotparser.RobotFileParser()
+        self.robot_parser.set_url(f"{self.domain_root}/robots.txt")
+
         meta = {
             "robots_present": False,
             "robots_status": None,
@@ -312,7 +350,13 @@ class SiteCrawler:
             seen.add(normalized)
             unique.append(normalized)
 
-        buckets = {k: [] for k in ("product", "category", "location", "article", "search", "other")}
+        # "home" is included here as a defensive backstop, not because we
+        # ever want to sample it: classify_url() can legitimately return
+        # "home" for a candidate URL (e.g. a stray homepage link that
+        # survives the self-exclusion check above in some edge case), and
+        # buckets[classify_url(url)] must never KeyError regardless. It gets
+        # no quota below, so any such URL is collected but never selected.
+        buckets = {k: [] for k in ("home", "product", "category", "location", "article", "search", "other")}
         for url in unique:
             buckets[classify_url(url)].append(url)
 
@@ -334,6 +378,116 @@ class SiteCrawler:
             selected.extend(leftovers[: self.max_pages - len(selected)])
 
         return selected[: max(0, self.max_pages - 1)]
+
+    def _evaluate_subdomain_pivot(self, html: str) -> str | None:
+        """
+        Detect if the current homepage is a routing portal with few local links,
+        and identify if a specific same-base subdomain should be crawled instead.
+
+        Two different patterns both count as "pivot-worthy":
+          1. Diffuse fan-out - many distinct subdomains each with only a
+             link or two (e.g. Wikipedia's ~300 per-language subdomains,
+             each linked once from the www.wikipedia.org portal).
+          2. A dominant cluster - one other subdomain clearly has more links
+             than any other (e.g. a blog/shop subdomain holding all the real
+             content: blog.example.com linked 20x from a bare www.example.com).
+
+        ORDERING (this was the actual Wikipedia bug): fan-out is now checked
+        BEFORE the current-page self-link gate, not after it. Previously the
+        gate ("does the current page already have >= MIN_SELF_LINKS_TO_SKIP_PIVOT
+        self-links? if so, it's real content, don't pivot") ran first and
+        short-circuited everything else. That's a reasonable question for an
+        ordinary homepage, but wrong for a portal: www.wikipedia.org has 4
+        self-links (logo, ToS, privacy policy - boilerplate) sitting right next
+        to ~272 distinct language subdomains. 4 >= 3 tripped the gate and the
+        fan-out signal - which was computed correctly the whole time - never
+        even got read. No ordinary site links to
+        MIN_DISTINCT_SUBDOMAINS_FOR_FANOUT+ distinct same-base subdomains from
+        its homepage; only a genuine portal does, regardless of how many
+        footer/legal links it also has to itself. So fan-out breadth is checked
+        on its own first, independent of current_count, and only if that
+        doesn't qualify does the self-link gate get a say (protecting the
+        dominant-cluster case from pivoting away from a page that already has
+        plenty of its own real content).
+
+        Diagnostics are stashed on self.last_pivot_diagnostics either way,
+        so build_cache() can surface *why* a pivot did or didn't happen -
+        useful for tuning the thresholds above against real sites.
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        parsed_root = urlparse(self.domain_root)
+        current_netloc = parsed_root.netloc
+
+        # Naive base domain extraction (strips www.)
+        base_domain = current_netloc[4:] if current_netloc.startswith("www.") else current_netloc
+
+        netloc_counts = {}
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag.get("href", "").strip()
+            if not href or href.startswith(("mailto:", "tel:", "javascript:", "data:")):
+                continue
+
+            full_url = normalize_url(urljoin(self.target_url, href))
+            parsed_url = urlparse(full_url)
+
+            if parsed_url.scheme != "https":
+                continue
+
+            net = parsed_url.netloc
+            # Only count links sharing the base domain
+            if net != base_domain and not net.endswith("." + base_domain):
+                continue
+
+            label = net[: -(len(base_domain) + 1)] if net != base_domain else ""
+            if label in INFRA_SUBDOMAIN_LABELS:
+                continue
+
+            netloc_counts[net] = netloc_counts.get(net, 0) + 1
+
+        current_count = netloc_counts.get(current_netloc, 0)
+        other_counts = {k: v for k, v in netloc_counts.items() if k != current_netloc}
+        diagnostics = {
+            "current_netloc": current_netloc,
+            "current_netloc_links": current_count,
+            "other_netloc_counts": other_counts,
+        }
+
+        # --- Pattern 1: diffuse fan-out, checked FIRST and independent of
+        # current_count. See the ordering note in the docstring above for why.
+        is_diffuse_fanout = len(other_counts) >= MIN_DISTINCT_SUBDOMAINS_FOR_FANOUT
+        if is_diffuse_fanout:
+            best_netloc = max(other_counts, key=other_counts.get)
+            diagnostics["decision"] = f"pivot_to::{best_netloc}"
+            diagnostics["pivot_reason"] = "diffuse_fanout"
+            self.last_pivot_diagnostics = diagnostics
+            return f"https://{best_netloc}"
+
+        # --- Pattern 2 gate: only an ordinary (non-portal) homepage with
+        # plenty of its own content should skip pivoting outright. This runs
+        # AFTER the fan-out check so it can no longer mask a portal's fan-out
+        # behind a handful of boilerplate self-links.
+        if current_count >= MIN_SELF_LINKS_TO_SKIP_PIVOT:
+            diagnostics["decision"] = "no_pivot_sufficient_self_links"
+            self.last_pivot_diagnostics = diagnostics
+            return None
+
+        # --- Pattern 2: dominant cluster - one other subdomain clearly wins.
+        best_netloc, best_count = None, 0
+        for net, count in other_counts.items():
+            if count > best_count:
+                best_netloc, best_count = net, count
+
+        is_dominant_cluster = best_count >= DOMINANT_CLUSTER_MIN_LINKS and best_count > current_count
+
+        if best_netloc and is_dominant_cluster:
+            diagnostics["decision"] = f"pivot_to::{best_netloc}"
+            diagnostics["pivot_reason"] = "dominant_cluster"
+            self.last_pivot_diagnostics = diagnostics
+            return f"https://{best_netloc}"
+
+        diagnostics["decision"] = "no_pivot_no_qualifying_candidate"
+        self.last_pivot_diagnostics = diagnostics
+        return None
 
     def fetch_page(self, url: str, index: int) -> dict:
         filepath = PAGES_DIR / f"page_{index}.html"
@@ -364,11 +518,17 @@ class SiteCrawler:
             record["final_url"] = str(resp.url)
             record["content_type"] = resp.headers.get("Content-Type", "")
 
-            if "html" not in record["content_type"].lower() and resp.status_code == 200:
-                record["content_classification"] = "non_html"
-                return record
-
+            # Extract the raw response text early for content checking
             html = resp.text or ""
+
+            # Prevent false non_html flags by checking the actual body text if the header is missing/weird
+            is_html_header = "html" in record["content_type"].lower()
+            if not is_html_header and resp.status_code == 200:
+                content_start = html[:1000].lower()
+                if "<html" not in content_start and "<!doctype" not in content_start:
+                    record["content_classification"] = "non_html"
+                    return record
+
             filepath.write_text(html, encoding="utf-8")
             challenge = detect_challenge(html, resp.status_code, resp.headers)
             record["text_length"] = challenge["text_length"]
@@ -426,6 +586,41 @@ class SiteCrawler:
         meta = self.fetch_and_parse_robots()
 
         homepage_record = self.fetch_page(self.target_url, 0)
+
+        # --- Subdomain Pivot Logic ---
+        pivot_diagnostics = None
+        homepage_path = PAGES_DIR / "page_0.html"
+        if homepage_record["success"] and homepage_path.exists():
+            html = homepage_path.read_text(encoding="utf-8")
+            pivot_root = self._evaluate_subdomain_pivot(html)
+            pivot_diagnostics = self.last_pivot_diagnostics
+
+            if pivot_root:
+                # Pivot to the dominant subdomain. target_url MUST go through
+                # normalize_url() here, same as every discovered link does -
+                # otherwise this ends up as "https://en.wikipedia.org" (no
+                # trailing slash) while a link back to that same homepage
+                # normalizes to "https://en.wikipedia.org/", the two never
+                # string-compare equal in sample_urls()'s self-exclusion
+                # check, and that stray homepage link slips through
+                # classify_url() as "home" - a bucket sample_urls() doesn't
+                # define, causing a KeyError('home') crash.
+                self.target_url = normalize_url(pivot_root)
+                self.domain_root = pivot_root
+
+                # Re-fetch robots.txt under the new subdomain's rules
+                meta = self.fetch_and_parse_robots()
+
+                # Re-fetch the new target as the authoritative page_0
+                homepage_record = self.fetch_page(self.target_url, 0)
+
+        # meta may have been replaced by the re-fetch above; attach the
+        # pivot diagnostics afterward either way so it's always visible in
+        # cache_index.json, whether or not a pivot actually happened.
+        if pivot_diagnostics is not None:
+            meta["subdomain_pivot"] = pivot_diagnostics
+        # ----------------------------------
+
         pages_manifest = [homepage_record]
 
         # The homepage can be challenged even with HTTP 200; that is not a normal crawl.
@@ -445,11 +640,12 @@ class SiteCrawler:
             meta["failure_reason"] = homepage_record.get("error", "Unknown fetch error")
 
         candidates = []
-        
+
         # 1. SITEMAP FIRST: Prioritize canonical, machine-readable syndication
         candidates.extend(self._read_sitemap_urls())
-        
+
         # 2. DOM SUPPLEMENT: Fall back to homepage links to catch orphaned pages
+        # Re-assign homepage_path just in case it wasn't captured above
         homepage_path = PAGES_DIR / "page_0.html"
         if homepage_record["success"] and homepage_path.exists():
             candidates.extend(
