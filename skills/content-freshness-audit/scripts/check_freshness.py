@@ -259,47 +259,6 @@ def parse_page_schemas(page):
     return nodes, malformed
 
 
-def check_malformed_schema(pages):
-    """
-    Surface broken JSON-LD as its own finding rather than silently discarding
-    it. A syntax error means the ENTIRE node is unreadable to any parser —
-    a more serious problem than a missing date field, and easy to miss
-    if it's only ever counted internally and never reported.
-    """
-    if not pages:
-        return None
-
-    malformed_pages = []
-    for page in pages:
-        _, malformed = parse_page_schemas(page)
-        if malformed:
-            malformed_pages.append(page["url"])
-
-    if not malformed_pages:
-        return None
-
-    return {
-        "id": "FRESH-004",
-        "title": "Malformed JSON-LD Structured Data",
-        "severity": "medium",
-        "evidence": (
-            f"{len(malformed_pages)}/{len(pages)} page(s) contain a "
-            f"<script type=\"application/ld+json\"> block that fails to "
-            f"parse as valid JSON, so none of that node's data (including "
-            f"any freshness or entity information it carries) is usable by "
-            f"any parser. Examples: {', '.join(malformed_pages[:3])}."
-        ),
-        "suggested_action": {
-            "summary": (
-                "Validate JSON-LD output against a JSON parser as part of "
-                "the build/publish pipeline — a single trailing comma or "
-                "unescaped quote silently voids the entire schema node."
-            ),
-            "priority": "medium",
-        },
-    }
-
-
 def check_schema_dates(pages):
     """
     Check structured freshness only on schema nodes where a freshness signal
@@ -527,10 +486,6 @@ def main():
         schema_finding = check_schema_dates(pages)
         if schema_finding:
             findings.append(schema_finding)
-
-        malformed_finding = check_malformed_schema(pages)
-        if malformed_finding:
-            findings.append(malformed_finding)
 
         copyright_finding = check_copyright_year(pages)
         if copyright_finding:

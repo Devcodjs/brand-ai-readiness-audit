@@ -24,3 +24,16 @@ https://fueler.io/
 maxfashion.in
 https://www.reliancedigital.in/
 steam.com
+
+$urls = "amazon.com","traditionalnortheast.com","bookmycaravan.in","maxfashion.in","reliancedigital.in","wikipedia.org","guwahatiplus.com","sgfragrances.in","fueler.io","gullylabs.com"
+
+$reports = $urls | ForEach-Object {
+    python skills/audit-orchestrator/scripts/compile_report.py --url $_ |
+        ConvertFrom-Json
+}
+
+$reports | ConvertTo-Json -Depth 100 |
+    Out-File -Encoding utf8 ".\reports\all_reports.json"
+
+
+done N dusted almost

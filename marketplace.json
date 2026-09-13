@@ -40,6 +40,9 @@
     {
       "id": "content-freshness-audit",
       "path": "skills/content-freshness-audit"
+    },
+    { "id": "engagement-audit",
+     "path": "skills/engagement-audit" 
     }
   ]
 }

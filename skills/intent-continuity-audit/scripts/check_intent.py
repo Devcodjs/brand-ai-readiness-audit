@@ -6,6 +6,8 @@ import sys
 import urllib.parse
 from pathlib import Path
 from bs4 import BeautifulSoup
+import requests
+from urllib.parse import urljoin, urlparse
 
 def load_cached_pages(cache_dir: str) -> list:
     index_path = Path(cache_dir) / "cache_index.json"
@@ -563,6 +565,224 @@ def proactive_smart_404(pages: list) -> dict | None:
         }
     return None
 
+def check_eng_redirects(pages: list) -> dict | None:
+    """ENG-REDIRECT-001: Excessive Redirect Chains (Latency & Bounce Risk)"""
+    affected_urls = []
+    high_severity_count = 0
+    
+    for page in pages:
+        chain = page.get("redirect_chain", [])
+        if not chain:
+            continue
+            
+        final_url = page.get("final_url") or page.get("url")
+        full_chain = [hop["url"] for hop in chain] + [final_url]
+        
+        real_hops = 0
+        cross_domain = False
+        https_downgrade = False
+        
+        for i in range(len(full_chain) - 1):
+            u1 = full_chain[i]
+            u2 = full_chain[i + 1]
+            
+            # Check HTTPS downgrade
+            if u1.startswith("https:") and u2.startswith("http:"):
+                https_downgrade = True
+                
+            p1 = urlparse(u1.lower())
+            p2 = urlparse(u2.lower())
+            n1 = p1.netloc.replace("www.", "")
+            n2 = p2.netloc.replace("www.", "")
+            
+            if n1 != n2:
+                cross_domain = True
+                
+            # Filter trivial hops: identical paths/queries where only scheme or www changed
+            if n1 == n2 and p1.path == p2.path and p1.query == p2.query:
+                continue 
+            else:
+                real_hops += 1
+
+        # Escalate severity based on what the chain actually costs the user
+        if real_hops >= 2 or cross_domain or https_downgrade:
+            affected_urls.append(page["url"])
+            if cross_domain or https_downgrade:
+                high_severity_count += 1
+                
+    if affected_urls:
+        severity = "high" if high_severity_count > 0 else "medium"
+        return {
+            "id": "ENG-REDIRECT-001",
+            "title": "Excessive Redirect Chains (High Bounce Risk)",
+            "severity": severity,
+            "evidence": (
+                f"{len(affected_urls)} sampled URL(s) triggered risky or multi-hop redirect chains before loading. "
+                f"Each intermediate hop adds network latency, which is a known engagement killer for referred traffic. "
+                f"Examples: {', '.join(affected_urls[:3])}."
+            ),
+            "suggested_action": {
+                "summary": "Collapse redirect chains to a single hop. Update internal links, sitemaps, and canonical tags to point directly to the final destination URL rather than relying on legacy server redirects to catch up.",
+                "priority": severity
+            }
+        }
+    return None
+
+def check_eng_broken_ctas(pages: list) -> dict | None:
+    """ENG-DEAD-LINK-001: Live check of primary CTAs and navigation links for 404s."""
+    broken_links = []
+    
+    # Standard browser UA to avoid instant WAF blocks on Python-requests
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+    
+    for page in pages:
+        soup = page["soup"]
+        base_url = page.get("final_url") or page["url"]
+        domain = urlparse(base_url).netloc
+        
+        # Target high-value engagement links: buttons, CTAs, or explicit nav links
+        cta_tags = soup.find_all("a", href=True, attrs={"class": re.compile(r"btn|cta|button|nav", re.I)})
+        if not cta_tags:
+            # Fallback to first few content links if no buttons found
+            content = soup.find(["main", "article", "[role='main']"]) or soup
+            cta_tags = content.find_all("a", href=True)[:3]
+            
+        sampled_urls = set()
+        for a in cta_tags:
+            href = a["href"].strip()
+            if href.startswith(("mailto:", "tel:", "javascript:", "#")):
+                continue
+            full_url = urljoin(base_url, href)
+            if urlparse(full_url).netloc == domain:
+                sampled_urls.add(full_url)
+            if len(sampled_urls) >= 3:
+                break
+                
+        # Fast HEAD request to check for actual Not Found errors
+        for target_url in sampled_urls:
+            try:
+                resp = requests.head(target_url, headers=headers, timeout=3, allow_redirects=True)
+                
+                # Strictly check for 404 (Not Found) or 410 (Gone).
+                # Do NOT flag 401, 403 (Forbidden/Blocked) or 429 (Rate Limited) as dead links.
+                if resp.status_code in {404, 410}:
+                    broken_links.append({"source": base_url, "target": target_url, "status": resp.status_code})
+            except requests.RequestException:
+                pass # Ignore timeouts/network failures; only flag confirmed HTTP errors
+
+    if broken_links:
+        severity = "high" if len(broken_links) > 2 else "medium"
+        examples = "; ".join(f"{b['target']} ({b['status']})" for b in broken_links[:3])
+        return {
+            "id": "ENG-DEAD-LINK-001",
+            "title": "Broken Internal Links / Dead CTAs",
+            "severity": severity,
+            "evidence": (
+                f"Sampled primary interaction links (CTAs/nav) across the audited pages and found "
+                f"{len(broken_links)} link(s) returning standard 'Not Found' HTTP errors. Examples: {examples}. "
+                f"NOTE: This check used an automated script. Some CDNs serve dynamic 404s to unrecognized bots."
+            ),
+            "suggested_action": {
+                "summary": (
+                    "Verify that these targets are genuinely dead for human visitors. If confirmed, fix or remove "
+                    "the 404ing links. Visitors arriving via AI citations bounce immediately if their next logical click is broken."
+                ),
+                "priority": severity
+            }
+        }
+    return None
+
+def check_eng_scannability(pages: list) -> dict | None:
+    """ENG-SCAN-001: Wall-of-Text Fatigue via Words-Between-Headings."""
+    fatigue_pages = []
+
+    for page in pages:
+        # Isolate the main content to ignore massive footer menus
+        content = page["soup"].find(["main", "article", "[role='main']"])
+        if not content:
+            content = page["soup"].find("body") or page["soup"]
+            
+        text = content.get_text(separator=" ", strip=True)
+        word_count = len(text.split())
+        
+        if word_count < 150:
+            continue # Skip thin pages (audited elsewhere)
+            
+        headings_count = len(content.find_all(["h2", "h3", "h4"]))
+        
+        # Calculate text density
+        words_per_heading = word_count / max(1, headings_count)
+        
+        if words_per_heading > 350:
+            fatigue_pages.append({"url": page["url"], "ratio": int(words_per_heading)})
+
+    if fatigue_pages:
+        ratio = len(fatigue_pages) / len(pages)
+        severity = "medium"
+        examples = ", ".join(f"{p['url']} (~{p['ratio']} words/heading)" for p in fatigue_pages[:3])
+        return {
+            "id": "ENG-SCAN-001",
+            "title": "Poor Content Scannability (Wall of Text)",
+            "severity": severity,
+            "evidence": (
+                f"{len(fatigue_pages)} sampled page(s) exhibit severe reading fatigue, averaging over 350 words "
+                f"per subheading. Examples: {examples}. AI-referred users scan for specific facts; unbroken text walls cause immediate abandonment."
+            ),
+            "suggested_action": {
+                "summary": "Break monolithic text blocks with descriptive <h2>/<h3> subheadings, bolded key takeaways, and bulleted lists. Ensure your CMS templates encourage structured content formatting.",
+                "priority": severity
+            }
+        }
+    return None
+
+def check_eng_arrival_orientation(pages: list) -> dict | None:
+    """ENG-ORIENT-001: Can a cold arrival instantly orient themselves?"""
+    disoriented_pages = []
+
+    for page in pages:
+        soup = page["soup"]
+        
+        # 1. Is there a clear, dominant H1?
+        has_h1 = bool(soup.find("h1"))
+        
+        # 2. Are there visual breadcrumbs? (Not schema, actual UI)
+        has_breadcrumbs = False
+        for selector in [".breadcrumb", "[aria-label*='breadcrumb' i]", "#breadcrumbs"]:
+            if soup.select_one(selector):
+                has_breadcrumbs = True
+                break
+                
+        # 3. Is the brand name/logo accessible in the header?
+        has_header_brand = False
+        header = soup.find(["header", "nav"])
+        if header:
+            if header.find("img", alt=True) or header.find(class_=re.compile(r"logo|brand", re.I)):
+                has_header_brand = True
+
+        # If a page lacks an H1 AND has no breadcrumbs, a cold arrival is lost.
+        if not has_h1 and not has_breadcrumbs:
+            disoriented_pages.append(page["url"])
+
+    if disoriented_pages:
+        ratio = len(disoriented_pages) / len(pages)
+        severity = "high" if ratio > 0.4 else "medium"
+        return {
+            "id": "ENG-ORIENT-001",
+            "title": "Poor Arrival Orientation for Deep Links",
+            "severity": severity,
+            "evidence": (
+                f"{len(disoriented_pages)} page(s) lack both a clear <h1> title and visual UI breadcrumbs. "
+                f"Examples: {', '.join(disoriented_pages[:3])}. Visitors arriving 'cold' from an AI citation have no contextual cues to understand where they are within the site hierarchy."
+            ),
+            "suggested_action": {
+                "summary": "Ensure every public URL features a prominent <h1> and visible navigational breadcrumbs. Do not rely solely on your homepage or hidden structured data to orient users.",
+                "priority": severity
+            }
+        }
+    return None
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
@@ -596,6 +816,10 @@ def main():
         lambda p: check_ica_008(p, site_type),
         lambda p: check_ica_009(p),
         lambda p: check_ica_010(p),
+        lambda p: check_eng_arrival_orientation(p),
+        lambda p: check_eng_scannability(p),
+        lambda p: check_eng_broken_ctas(p),
+        lambda p: check_eng_redirects(p),
     ]
     
     for check in checks:
