@@ -186,7 +186,7 @@ def _safe_fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
         return {"ok": False, "kind": "unknown_error", "error": str(exc)}
 
     content_type = (resp.headers.get("content-type") or "").lower()
-    text = resp.text if "text" in content_type or "html" in content_type or not content_type else resp.text
+    text = resp.text
     challenged, reason = looks_like_challenge(url=url, final_url=resp.url, html=text)
     if challenged:
         return {
@@ -387,14 +387,21 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
 
     if not raw_pages:
         findings, meta = _fallback_single_page(target_url)
-        return {"findings": findings, "evidence": meta}
+        return {"findings": findings, "evidence": meta, "proactive_actions": []}
 
     pages: List[Tuple[dict, str]] = []
     challenge_pages: List[dict] = []
     unusable_reasons = Counter()
     for page in raw_pages:
-        html, load_error = _load_page_html(page)
-        usable, reason = _page_is_usable(page, html)
+        if not isinstance(page, dict):
+            unusable_reasons["invalid_page_record"] += 1
+            continue
+        try:
+            html, load_error = _load_page_html(page)
+            usable, reason = _page_is_usable(page, html)
+        except Exception as exc:  # a single malformed manifest entry should not abort the whole audit
+            unusable_reasons[f"page_processing_error:{type(exc).__name__}"] += 1
+            continue
         if usable and html is not None:
             pages.append((page, html))
         else:
@@ -423,6 +430,7 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
                 )
             ],
             "evidence": evidence,
+            "proactive_actions": [],
         }
 
     all_same_as: Set[str] = set()
@@ -436,40 +444,48 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
     pages_with_org = 0
     page_schema_counts = Counter()
     org_urls: Set[str] = set()
+    page_processing_errors: List[str] = []
 
     for page, html in pages:
         page_url = page.get("final_url") or page.get("url") or "unknown"
-        nodes, malformed = extract_page_schemas(html)
-        if nodes:
-            pages_with_jsonld += 1
-            for node in nodes:
-                for t in _types_of(node):
-                    page_schema_counts[t] += 1
-        if malformed:
-            malformed_pages.append(page_url)
+        try:
+            nodes, malformed = extract_page_schemas(html)
+            if nodes:
+                pages_with_jsonld += 1
+                for node in nodes:
+                    for t in _types_of(node):
+                        page_schema_counts[t] += 1
+            if malformed:
+                malformed_pages.append(page_url)
 
-        org = _org_schema_summary(nodes)
-        if org["count"]:
-            pages_with_org += 1
-            all_same_as.update(org["same_as"])
-            org_names.update(org["names"])
-            org_urls.update(org["urls"])
-            for prop in REQUIRED_ORG_PROPS:
-                if org["missing"].get(prop):
-                    org_missing_props[prop].append(page_url)
+            org = _org_schema_summary(nodes)
+            if org["count"]:
+                pages_with_org += 1
+                all_same_as.update(org["same_as"])
+                org_names.update(org["names"])
+                org_urls.update(org["urls"])
+                for prop in REQUIRED_ORG_PROPS:
+                    if org["missing"].get(prop):
+                        org_missing_props[prop].append(page_url)
 
-        page_type = _norm(page.get("page_type")).lower()
-        is_product = page_type in PRODUCT_PAGE_TYPES
-        if not is_product:
-            path = (urlparse(page_url).path or "").lower()
-            is_product = any(token in path for token in ("/product/", "/products/", "/dp/", "/p/"))
-        if is_product:
-            product_pages_checked += 1
-            has_product = any(_types_of(node) & PRODUCT_TYPES for node in nodes)
-            if has_product:
-                product_pages_with_schema += 1
-            else:
-                product_pages_missing_schema.append(page_url)
+            page_type = _norm(page.get("page_type")).lower()
+            is_product = page_type in PRODUCT_PAGE_TYPES
+            if not is_product:
+                path = (urlparse(page_url).path or "").lower()
+                is_product = any(token in path for token in ("/product/", "/products/", "/dp/", "/p/"))
+            if is_product:
+                product_pages_checked += 1
+                has_product = any(_types_of(node) & PRODUCT_TYPES for node in nodes)
+                if has_product:
+                    product_pages_with_schema += 1
+                else:
+                    product_pages_missing_schema.append(page_url)
+        except Exception as exc:
+            # A single page's unexpected shape (e.g. schema extraction choking
+            # on it) should degrade to "one page skipped", not abort the audit
+            # and return nothing for the whole site.
+            page_processing_errors.append(f"{page_url} ({type(exc).__name__})")
+            continue
 
     evidence.update({
         "pages_with_jsonld": pages_with_jsonld,
@@ -477,6 +493,7 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
         "product_pages_checked": product_pages_checked,
         "product_pages_with_schema": product_pages_with_schema,
         "schema_type_counts": dict(page_schema_counts),
+        "page_processing_errors": page_processing_errors,
     })
 
     findings: List[dict] = []
@@ -604,13 +621,46 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
     }
 
 
+def _fatal_result(target_url: str, exc: BaseException) -> Dict[str, Any]:
+    """Last-resort payload so the orchestrator always gets parseable JSON,
+    even if something outside this module's control (bad args, an
+    unexpected manifest shape, a missing dependency) blows up before the
+    normal findings/evidence logic can run. A crashed process that prints
+    a traceback and exits non-zero looks, from the orchestrator's side,
+    identical to a skill that was never invoked at all -- this keeps that
+    failure mode from being silent.
+    """
+    return {
+        "findings": [
+            _finding(
+                "ENTITY-INTERNAL-ERROR",
+                "Entity Audit Failed To Run",
+                "high",
+                f"The entity validator raised an unhandled {type(exc).__name__} before it could inspect {target_url}: {exc}",
+                "This is a validator/runtime fault, not a finding about the target site. Check invocation arguments (--url / --cache-dir) and the cache_index.json shape.",
+                "high",
+            )
+        ],
+        "evidence": {"mode": "internal_error", "evidence_confidence": "LOW", "error_type": type(exc).__name__},
+        "proactive_actions": [],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Validate site entity graph from a crawl manifest.")
-    parser.add_argument("--url", required=True, help="Target website URL")
-    parser.add_argument("--cache-dir", default="audit-cache", help="Directory containing cache_index.json")
-    args = parser.parse_args()
+    # Primary flags, plus tolerant aliases: if the orchestrator's dispatcher
+    # calls every skill with a slightly different flag-naming convention,
+    # these still resolve to the same dest instead of failing argument
+    # parsing outright.
+    parser.add_argument("--url", "--target-url", "--site-url", dest="url", required=True, help="Target website URL")
+    parser.add_argument("--cache-dir", "--cache_dir", dest="cache_dir", default="audit-cache", help="Directory containing cache_index.json")
+    args, _unknown = parser.parse_known_args()
 
-    result = validate_entity_graph(args.url, cache_dir=args.cache_dir)
+    try:
+        result = validate_entity_graph(args.url, cache_dir=args.cache_dir)
+    except Exception as exc:  # noqa: BLE001 - last line of defense, see _fatal_result
+        result = _fatal_result(args.url, exc)
+
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
