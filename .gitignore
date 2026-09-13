@@ -3,3 +3,4 @@ __pycache__/
 audit-cache/
 venv/
 .env
+reports
