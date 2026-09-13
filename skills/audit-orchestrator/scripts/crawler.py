@@ -1094,6 +1094,7 @@ class SiteCrawler:
             "challenge_score": 0.0,
             "challenge_signals": [],
             "challenge_patterns": [],
+            "redirect_chain": [],
         }
 
         try:
@@ -1119,6 +1120,16 @@ class SiteCrawler:
                 )
             )
 
+            # --- NEW: Capture Redirect Chain Telemetry ---
+            if resp.history:
+                record["redirect_chain"] = [
+                    {"status": r.status_code, "url": str(r.url)} 
+                    for r in resp.history
+                ]
+            else:
+                record["redirect_chain"] = []
+            # ---------------------------------------------
+            
             html = resp.text or ""
 
             # Check if payload is non-HTML.

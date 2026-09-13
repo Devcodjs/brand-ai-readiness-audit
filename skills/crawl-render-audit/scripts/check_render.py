@@ -5,6 +5,7 @@ import re
 import sys
 import urllib.robotparser
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -23,16 +24,6 @@ from evidence_gate import (
     extract_text,
     summarize_blocked_url_targets,
 )
-
-# Named AI/search crawlers sites are actually allow-listing today — verified
-# against a real 2026 robots.txt, which explicitly named several of these
-# that weren't previously tracked here.
-AI_BOTS = [
-    "GPTBot", "ClaudeBot", "Claude", "Claude-SearchBot", "PerplexityBot",
-    "Perplexity-User", "Google-Extended", "Gemini", "OAI-SearchBot",
-    "ChatGPT-User", "CCBot", "Bytespider", "Amazonbot", "meta-externalagent",
-    "Grok",
-]
 
 # Pure AI Discoverability & Search Agents (No Foundation Model Training Scrapers)
 DISCOVERABILITY_BOTS = [
@@ -172,7 +163,6 @@ def heuristic_static_render_estimate(raw_html: str) -> dict:
 
 
 def raw_render_metrics(raw_html: str, live_url: str | None, live_render: bool) -> dict:
-    """Evaluates rendering metrics entirely using static HTML heuristics (no Playwright)."""
     raw_text = extract_text(raw_html)
     metrics = {
         "raw_text_length": len(raw_text),
@@ -185,8 +175,6 @@ def raw_render_metrics(raw_html: str, live_url: str | None, live_render: bool) -
         "render_caveat": None,
         "render_error": None,
     }
-
-    # Pass the raw HTML directly to the heuristic analysis
     metrics.update(heuristic_static_render_estimate(raw_html))
     return metrics
 
@@ -235,36 +223,85 @@ def robots_allows_fetch(url: str, cache_dir: str, user_agent: str = "*") -> bool
 
 def noindex_findings(pages: list) -> list:
     noindexed = []
+    parsed_pages = 0
+    homepage_noindexed = False
+    homepage_url = None
+
     for page in pages:
         path = page.get("file")
         page_url = page.get("final_url") or page.get("url", "unknown")
         header_tag = (page.get("headers") or {}).get("X-Robots-Tag", "")
-        if header_tag and "noindex" in header_tag.lower():
-            noindexed.append(page_url)
-            continue
-        if path and os.path.exists(path):
+
+        is_noindex = False
+        parsed_successfully = False
+
+        if header_tag:
+            parsed_successfully = True
+            if "noindex" in header_tag.lower():
+                is_noindex = True
+
+        if not is_noindex and path and os.path.exists(path):
             try:
                 html = Path(path).read_text(encoding="utf-8", errors="ignore")
+                soup = BeautifulSoup(html, "html.parser")
+                parsed_successfully = True
+                tag = soup.find("meta", attrs={"name": re.compile(r"robots", re.I)})
+                if tag and "noindex" in (tag.get("content") or "").lower():
+                    is_noindex = True
             except OSError:
-                continue
-            soup = BeautifulSoup(html, "html.parser")
-            tag = soup.find("meta", attrs={"name": re.compile("robots", re.I)})
-            if tag and "noindex" in (tag.get("content") or "").lower():
-                noindexed.append(page_url)
+                pass
 
-    if not noindexed:
+        if parsed_successfully:
+            parsed_pages += 1
+            if is_noindex:
+                noindexed.append(page_url)
+                path_part = urlparse(page_url).path
+                is_home = (
+                    page.get("page_type") == "home"
+                    or page.get("index") == 0
+                    or path_part in ("", "/")
+                )
+                if is_home:
+                    homepage_noindexed = True
+                    homepage_url = page_url
+
+    if not noindexed or parsed_pages == 0:
         return []
+
+    ratio = len(noindexed) / parsed_pages
+
+    if homepage_noindexed or ratio >= 0.8:
+        severity = "critical"
+        if homepage_noindexed and ratio >= 0.8:
+            reason = f"the homepage ({homepage_url}) and {ratio:.0%} of verified pages carry a noindex directive"
+        elif homepage_noindexed:
+            reason = f"the root homepage ({homepage_url}) explicitly forbids indexing via noindex"
+        else:
+            reason = f"{len(noindexed)}/{parsed_pages} ({ratio:.0%}) verified pages carry a noindex directive"
+    elif ratio >= 0.4 or len(noindexed) > 1:
+        severity = "high"
+        reason = f"{len(noindexed)}/{parsed_pages} ({ratio:.0%}) verified pages carry a noindex directive"
+    else:
+        severity = "medium"
+        reason = f"{len(noindexed)}/{parsed_pages} verified page carries a noindex directive"
+
     return [{
         "id": "DISC-NOINDEX-001",
         "title": "Pages Blocked From Indexing via noindex",
-        "severity": "high" if len(noindexed) > 1 else "medium",
+        "severity": severity,
         "evidence": (
-            f"{len(noindexed)} normal-content page(s) carry a noindex meta tag or X-Robots-Tag header, "
-            f"preventing search and AI indices from citing them. Examples: {', '.join(noindexed[:5])}."
+            f"CONFESSION: Site-level policy explicitly declares {reason}. "
+            f"Because this is declared directly in HTML meta tags or HTTP headers, "
+            f"AI and search indexers honor this directive regardless of bot identity. "
+            f"Examples: {', '.join(noindexed[:5])}."
         ),
         "suggested_action": {
-            "summary": "Remove noindex directives from public pages intended to be discovered and cited by AI systems.",
-            "priority": "high" if len(noindexed) > 1 else "medium",
+            "summary": (
+                "Ideal Fix: Remove 'noindex' from <meta name='robots'> and X-Robots-Tag headers on public canonical routes. "
+                "Scalable Quick Win: Check your global CMS settings (e.g., WordPress 'Discourage search engines' toggle), "
+                "SEO plugins, or edge CDN transform rules to unblock indexability globally at the template level."
+            ),
+            "priority": severity,
         },
     }]
 
@@ -335,14 +372,19 @@ def audit_crawl_and_render(
         })
 
     if blocked_pages:
+        ratio = len(blocked_pages) / max(1, len(pages))
+        severity = "high" if ratio >= 0.8 else "medium"
         findings.append({
             "id": "CRAWL-BLOCKED-002",
             "title": "Access-Restricted Pages Detected",
-            "severity": "medium",
-            "evidence": f"{len(blocked_pages)}/{len(pages)} sampled URLs returned access/auth restrictions instead of normal content.",
+            "severity": severity,
+            "evidence": (
+                f"{len(blocked_pages)}/{len(pages)} sampled URLs returned access/auth restrictions or bot-challenges instead of normal content. "
+                f"NOTE: This crawl used a generic browser signature. If your WAF (e.g., Cloudflare, Akamai) allowlists verified AI crawlers, real bots may bypass this block."
+            ),
             "suggested_action": {
-                "summary": "Keep important public information outside authentication or access barriers when it is intended to be discoverable by AI systems.",
-                "priority": "medium",
+                "summary": "Check server access logs for 200 OK responses to 'OAI-SearchBot' or 'PerplexityBot'. If they are also blocked, update your edge WAF rules to explicitly allowlist verified AI discovery agents.",
+                "priority": severity,
             },
         })
 
@@ -379,9 +421,6 @@ def audit_crawl_and_render(
         if not m.get("render_available") and m.get("heuristic_score") is not None
     ]
 
-    # This block handles rendering if Playwright was available. 
-    # Since we removed Playwright, this block effectively will never run, 
-    # but is safely left intact in case future modules restore `render_available = True`.
     if rendered:
         tiered = []
         for m in rendered:
@@ -436,13 +475,15 @@ def audit_crawl_and_render(
                 if "very_low_text_to_html_ratio" in sigs or "low_text_to_html_ratio" in sigs:
                     csr_ratio.append(url)
 
+            csr_caveat = "NOTE: This observation relies on a standard browser UA. If you use dynamic rendering (e.g., Prerender.io) via UA-sniffing, verified bots may receive full HTML."
+
             if csr_loading:
                 findings.append({
                     "id": "CRAWL-RENDER-CSR-LOADING",
                     "title": "Client-Side Rendering: Loading Placeholder Detected",
                     "severity": "high",
-                    "evidence": f"Found explicit loading placeholders inside initial HTML mount points across {len(csr_loading)} page(s). Text content is missing until JS executes. Examples: {', '.join(csr_loading[:3])}.",
-                    "suggested_action": {"summary": "Implement Server-Side Rendering (SSR) so the initial HTML payload delivers complete body text rather than a loading state.", "priority": "high"},
+                    "evidence": f"Found explicit loading placeholders inside initial HTML mount points across {len(csr_loading)} page(s). {csr_caveat} Examples: {', '.join(csr_loading[:3])}.",
+                    "suggested_action": {"summary": "Verify that your edge router serves pre-rendered DOMs to AI user-agents. If not, implement SSR/SSG to deliver complete text rather than a loading state.", "priority": "high"},
                 })
 
             if csr_empty:
@@ -450,8 +491,8 @@ def audit_crawl_and_render(
                     "id": "CRAWL-RENDER-CSR-EMPTY",
                     "title": "Client-Side Rendering: Empty Framework Mount Point",
                     "severity": "high",
-                    "evidence": f"Detected empty framework mount points in the raw HTML of {len(csr_empty)} page(s), requiring JS hydration to assemble content. Examples: {', '.join(csr_empty[:3])}.",
-                    "suggested_action": {"summary": "Pre-render HTML content on the server (SSR/SSG) so search and AI crawlers can index the page without running client-side scripts.", "priority": "high"},
+                    "evidence": f"Detected empty framework mount points in the raw HTML of {len(csr_empty)} page(s), requiring JS hydration. {csr_caveat} Examples: {', '.join(csr_empty[:3])}.",
+                    "suggested_action": {"summary": "Verify that your edge router serves pre-rendered DOMs to AI user-agents. If not, implement SSR/SSG so crawlers can index content without running client-side scripts.", "priority": "high"},
                 })
 
             if csr_noscript:
@@ -459,7 +500,7 @@ def audit_crawl_and_render(
                     "id": "CRAWL-RENDER-CSR-NOSCRIPT",
                     "title": "Client-Side Rendering: JS Requirement Notice",
                     "severity": "medium",
-                    "evidence": f"Found <noscript> tags explicitly instructing visitors to enable JavaScript to view content across {len(csr_noscript)} page(s). Examples: {', '.join(csr_noscript[:3])}.",
+                    "evidence": f"Found <noscript> tags explicitly instructing visitors to enable JavaScript to view content across {len(csr_noscript)} page(s). {csr_caveat} Examples: {', '.join(csr_noscript[:3])}.",
                     "suggested_action": {"summary": "Ensure primary informational content is rendered directly in the HTML response for clients without JavaScript runtime support.", "priority": "medium"},
                 })
 
@@ -468,7 +509,7 @@ def audit_crawl_and_render(
                     "id": "CRAWL-RENDER-CSR-BUNDLER",
                     "title": "Client-Side Rendering: Bundler Scripts with Minimal HTML Text",
                     "severity": "medium",
-                    "evidence": f"Detected heavy SPA bundler scripts (Webpack, Next.js, Vite) paired with unusually thin visible text across {len(csr_bundler)} page(s). Examples: {', '.join(csr_bundler[:3])}.",
+                    "evidence": f"Detected heavy SPA bundler scripts (Webpack, Next.js, Vite) paired with unusually thin visible text across {len(csr_bundler)} page(s). {csr_caveat} Examples: {', '.join(csr_bundler[:3])}.",
                     "suggested_action": {"summary": "Configure client-side bundler setups to deliver pre-rendered static content for public landing pages.", "priority": "medium"},
                 })
 
@@ -479,14 +520,10 @@ def audit_crawl_and_render(
                     "severity": "medium",
                     "evidence": (
                         f"Observed an unusually low ratio of visible text to HTML markup (< 10%) across {len(csr_ratio)} page(s). "
-                        f"Heavy DOM structures with sparse text dilute the semantic signal for AI readers. Examples: {', '.join(csr_ratio[:3])}."
+                        f"Heavy DOM structures with sparse text dilute the semantic signal. {csr_caveat} Examples: {', '.join(csr_ratio[:3])}."
                     ),
                     "suggested_action": {
-                        "summary": (
-                            "Low initial text density impairs LLM parsing of raw HTML responses. If search assistants "
-                            "do not ingest your content through pre-rendered feeds or structured APIs, verify that core "
-                            "informational copy (product specs, titles, pricing) is directly embedded in the server-delivered DOM."
-                        ),
+                        "summary": "Low initial text density impairs LLM parsing. Verify that core informational copy is directly embedded in the server-delivered DOM.",
                         "priority": "medium",
                     },
                 })
@@ -509,22 +546,46 @@ def audit_crawl_and_render(
         })
 
     findings.extend(noindex_findings(normal_pages))
+    
     blocked_bots, robot_meta = robots_findings(target_url, cache_dir)
     if blocked_bots:
-        high_priority_hit = any(bot in blocked_bots for bot in HIGH_PRIORITY_BOTS)
+        is_total_block = len(blocked_bots) == len(DISCOVERABILITY_BOTS)
+        
+        severity = "critical" if is_total_block else "high"
+        
+        if is_total_block:
+            evidence_str = f"CONFESSION: robots.txt explicitly disallows ALL tracked AI search/retrieval agents ({', '.join(blocked_bots)}). This prevents live retrieval, meaning AI cannot fetch current facts directly from your site."
+            action_summary = (
+                "This block prevents future crawling but does not erase past training data. AI systems will still answer "
+                "questions about your brand using stale memory or third-party mentions, but you permanently lose the ability "
+                "to correct outdated information or earn referral citations. If this is a deliberate strategy to protect a data moat, "
+                "no action is needed. However, if accurate self-representation and referral traffic matter, removing these "
+                "specific retrieval-bot disallows is required to restore live AI discoverability."
+            )
+        else:
+            evidence_str = f"CONFESSION: robots.txt explicitly disallows specific AI search/retrieval agents: {', '.join(blocked_bots)}."
+            action_summary = (
+                "Review robots.txt rules for AI/search crawlers. Ensure you are not accidentally blocking specific discovery engines "
+                "(like OAI-SearchBot or PerplexityBot) due to legacy security templates. Blocking these bots forces them to rely on "
+                "stale training data or third-party mentions rather than your live site."
+            )
+
         findings.append({
             "id": "DISC-ROBOTS-001",
             "title": "AI Crawler User-Agents Blocked by robots.txt",
-            "severity": "high" if high_priority_hit else "medium",
-            "evidence": f"robots.txt disallows these AI/search user-agents for the audited target: {', '.join(blocked_bots)}.",
-            "suggested_action": {"summary": "Review robots.txt rules for AI/search crawlers and explicitly allow the agents you intend to use for discovery, subject to your site's policy.", "priority": "high" if high_priority_hit else "medium"},
+            "severity": severity,
+            "evidence": evidence_str,
+            "suggested_action": {
+                "summary": action_summary, 
+                "priority": severity
+            },
         })
     elif robot_meta["robots_checked"]:
         findings.append({
             "id": "DISC-PASS-000",
             "title": "AI Crawling Not Blocked by robots.txt",
             "severity": "info",
-            "evidence": "Checked cached robots.txt against standard AI/search user-agents; no explicit disallow was found for the audited target URL.",
+            "evidence": "Checked cached robots.txt against standard AI discoverability user-agents; no explicit disallow was found for the audited target URL.",
             "suggested_action": None,
         })
 
@@ -547,7 +608,7 @@ if __name__ == "__main__":
         action="store_false",
         help="Skip live browser navigation and fall back to cached_dom parsing only.",
     )
-    parser.set_defaults(live_render=True)
+    parser.set_defaults(live_render=False)
     args = parser.parse_args()
     print(json.dumps(
         audit_crawl_and_render(
