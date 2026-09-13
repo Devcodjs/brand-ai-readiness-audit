@@ -28,8 +28,21 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
-import requests
-from bs4 import BeautifulSoup
+try:
+    import requests
+except ImportError:  # pragma: no cover - environment-dependent
+    # If this dependency is missing in whatever sandbox runs the skill
+    # scripts, an unguarded `import requests` at module load time would
+    # raise before main()'s own try/except ever gets a chance to run,
+    # crashing the process with no stdout at all. From the orchestrator's
+    # side that is indistinguishable from this skill never being wired in
+    # -- so every use of `requests` below is guarded on this being None.
+    requests = None  # type: ignore[assignment]
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:  # pragma: no cover - environment-dependent
+    BeautifulSoup = None  # type: ignore[assignment]
 
 
 ORG_TYPES = {"Organization", "Brand", "Corporation", "LocalBusiness"}
@@ -661,7 +674,7 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001 - last line of defense, see _fatal_result
         result = _fatal_result(args.url, exc)
 
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    print(json.dumps(result["findings"], indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
