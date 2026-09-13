@@ -34,3 +34,6 @@ $reports = $urls | ForEach-Object {
 
 $reports | ConvertTo-Json -Depth 100 |
     Out-File -Encoding utf8 ".\reports\all_reports.json"
+
+
+done N dusted almost
