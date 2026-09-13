@@ -283,6 +283,7 @@ def _eligible_skills(checks, meta: dict, pages: list[dict]) -> tuple[list[tuple[
 
 
 def _dedupe_findings(findings: list[dict]) -> list[dict]:
+    # --- Pass 1: exact-duplicate removal (same id + title + evidence) ---
     seen = set()
     result = []
     for finding in findings:
@@ -294,7 +295,52 @@ def _dedupe_findings(findings: list[dict]) -> list[dict]:
             continue
         seen.add(key)
         result.append(finding)
+
+    # --- Pass 2: cross-skill redundancy suppression ---
+    # When two different skills surface findings that are symptoms of
+    # the same root cause, keep the more specific/authoritative finding
+    # and suppress the redundant one (appending a cross-reference).
+    #
+    # Format: (suppressed_id, authoritative_prefix, root_cause_label)
+    REDUNDANCY_RULES = [
+        # CEA-007 (noscript JS-locked) is a subset of CRAWL-RENDER-CSR-NOSCRIPT
+        ("CEA-007", "CRAWL-RENDER-CSR-NOSCRIPT", "client-side rendering"),
+        # CEA-007 is also redundant if any CSR finding already fired
+        ("CEA-007", "CRAWL-RENDER-CSR-RATIO",    "client-side rendering"),
+        ("CEA-007", "CRAWL-RENDER-CSR-LOADING",   "client-side rendering"),
+        ("CEA-007", "CRAWL-RENDER-CSR-EMPTY",     "client-side rendering"),
+        ("CEA-007", "CRAWL-RENDER-CSR-BUNDLER",   "client-side rendering"),
+    ]
+
+    finding_ids = {str(f.get("id", "")) for f in result}
+
+    for suppress_id, auth_id, root_cause in REDUNDANCY_RULES:
+        if suppress_id in finding_ids and auth_id in finding_ids:
+            suppressed = []
+            kept = []
+            auth_finding = None
+            for f in result:
+                fid = str(f.get("id", ""))
+                if fid == suppress_id:
+                    suppressed.append(f)
+                else:
+                    if fid == auth_id:
+                        auth_finding = f
+                    kept.append(f)
+
+            # Cross-reference: append note to the authoritative finding
+            if auth_finding and suppressed:
+                xref_note = (
+                    f" [Cross-skill note: a corroborating '{suppress_id}' finding from "
+                    f"another skill was suppressed as it describes the same {root_cause} root cause.]"
+                )
+                auth_finding["evidence"] = str(auth_finding.get("evidence", "")) + xref_note
+
+            result = kept
+            finding_ids = {str(f.get("id", "")) for f in result}
+
     return result
+
 
 
 def orchestrate_audit(raw_url: str) -> dict:
@@ -504,4 +550,10 @@ if __name__ == "__main__":
     parser.add_argument("--url", required=True, help="Target URL or domain to audit")
     args = parser.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
-    print(json.dumps(orchestrate_audit(args.url), indent=2))
+    try:
+        print(json.dumps(orchestrate_audit(args.url), indent=2))
+    finally:
+        import shutil
+        from crawler import CACHE_DIR
+        if CACHE_DIR.exists():
+            shutil.rmtree(CACHE_DIR, ignore_errors=True)

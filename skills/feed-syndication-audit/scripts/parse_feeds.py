@@ -114,13 +114,16 @@ def audit_syndication(url: str, cache_dir: str) -> list[dict]:
         "Accept": "text/markdown, text/plain, */*"
     }
     
-    manifest_urls = [f"{domain_root}/llms.txt", f"{domain_root}/agents.md"]
-    found_url = None
-    content = ""
-    
-    for m_url in manifest_urls:
+    manifest_specs = [
+        {"url": f"{domain_root}/llms.txt",   "label": "/llms.txt",   "id_suffix": "LLMSTXT"},
+        {"url": f"{domain_root}/agents.md",  "label": "/agents.md",  "id_suffix": "AGENTSMD"},
+    ]
+
+    # Fetch every manifest independently — no early break
+    found_manifests = []  # list of {"spec": ..., "body": ...}
+    for spec in manifest_specs:
         try:
-            resp = requests.get(m_url, headers=headers, timeout=4, allow_redirects=True)
+            resp = requests.get(spec["url"], headers=headers, timeout=4, allow_redirects=True)
             if resp.status_code == 200:
                 body = resp.text.strip()
                 ct = resp.headers.get("Content-Type", "").lower()
@@ -129,13 +132,11 @@ def audit_syndication(url: str, cache_dir: str) -> list[dict]:
                 if "text/html" in ct or body.startswith("<!doctype") or "<html" in body[:200].lower():
                     continue
                     
-                found_url = m_url
-                content = body
-                break
+                found_manifests.append({"spec": spec, "body": body})
         except requests.RequestException:
             continue
 
-    if not found_url:
+    if not found_manifests:
         findings.append({
             "id": "FEED-PROACTIVE-LLMSTXT",
             "title": "Publish an AI-Specific Agent Manifest (/llms.txt)",
@@ -152,71 +153,140 @@ def audit_syndication(url: str, cache_dir: str) -> list[dict]:
         })
         return findings
 
-    # Evaluate internal structure
-    has_h1 = bool(re.search(r"^#\s+[^\n]+", content, re.MULTILINE))
-    has_summary_quote = bool(re.search(r"^>\s+[^\n]+", content, re.MULTILINE))
-    
-    # Extract markdown links: [Title](URL)
-    raw_links = re.findall(r"\[([^\]]+)\]\((https?://[^\s\)]+|/[^\s\)]+)\)", content)
-    
-    issues = []
-    if not has_h1:
-        issues.append("missing H1 entity title ('# Brand Name')")
-    if not has_summary_quote:
-        issues.append("missing blockquote summary ('> Brand Overview')")
-    if not raw_links:
-        issues.append("contains no structured markdown links to core resources")
+    # Evaluate EACH manifest independently
+    for manifest in found_manifests:
+        spec = manifest["spec"]
+        content = manifest["body"]
+        m_url = spec["url"]
+        id_suffix = spec["id_suffix"]
+        is_agents_md = id_suffix == "AGENTSMD"
 
-    # Sample link targets to ensure they don't 404
-    dead_links = []
-    for title, link in raw_links[:3]:
-        full_link = urljoin(domain_root, link)
-        try:
-            chk = requests.head(full_link, headers=headers, timeout=3, allow_redirects=True)
-            if chk.status_code in {404, 410}:
-                dead_links.append(f"{title} ({full_link})")
-        except requests.RequestException:
-            pass
+        has_h1 = bool(re.search(r"^#\s+[^\n]+", content, re.MULTILINE))
 
-    if dead_links:
-        issues.append(f"contains dead internal links: {', '.join(dead_links)}")
+        # Extract markdown links: [Title](URL)
+        raw_links = re.findall(r"\[([^\]]+)\]\((https?://[^\s\)]+|/[^\s\)]+)\)", content)
 
-    # Check for companion llms-full.txt
-    has_full_companion = False
-    if found_url.endswith("/llms.txt"):
-        try:
-            full_resp = requests.head(f"{domain_root}/llms-full.txt", headers=headers, timeout=2)
-            has_full_companion = (full_resp.status_code == 200)
-        except requests.RequestException:
-            pass
+        issues = []
+        if not has_h1:
+            issues.append("missing H1 entity title ('# Brand Name')")
 
-    # Surface findings based on audit quality
-    if issues:
-        findings.append({
-            "id": "FEED-AI-MANIFEST-DEFECT",
-            "title": "AI Manifest Found but Incomplete or Malformed",
-            "severity": "medium",
-            "evidence": f"Found manifest at {found_url}, but structural issues were detected: {'; '.join(issues)}.",
-            "suggested_action": {
-                "summary": (
-                    "Align your /llms.txt with the standardized format: start with '# Brand' and a '> Summary' quote, "
+        if is_agents_md:
+            # --- agents.md format-specific checks ---
+            section_headers = re.findall(r"^##\s+[^\n]+", content, re.MULTILINE)
+            has_sections = len(section_headers) >= 2
+
+            # Check for endpoint declarations (URLs with path patterns like /products/, /api/, /.well-known/)
+            endpoint_urls = re.findall(
+                r"(?:GET|POST|PUT|DELETE|PATCH)\s+(https?://[^\s]+|/[^\s]+)", content
+            )
+            inline_endpoints = re.findall(
+                r"`(?:GET|POST)\s+(/[^`]+)`", content
+            )
+            has_endpoints = len(endpoint_urls) > 0 or len(inline_endpoints) > 0
+
+            # Check for policy / store-metadata links
+            policy_links = [
+                lnk for _, lnk in raw_links
+                if any(kw in lnk.lower() for kw in ("policy", "policies", "terms", "privacy", "refund", "shipping"))
+            ]
+
+            # Check for commerce protocol signals (UCP, MCP, Shop)
+            has_commerce_protocol = bool(
+                re.search(r"(universal commerce protocol|UCP|MCP|shop\.app|commerce protocol)", content, re.I)
+            )
+
+            if not has_sections:
+                issues.append("missing structured '## Section' headers to organize agent instructions")
+            if not has_endpoints and not raw_links:
+                issues.append("contains no API endpoint declarations or resource links for agent discovery")
+            if not policy_links and not has_commerce_protocol:
+                issues.append("missing store policy links or commerce protocol declaration")
+
+            # Build evidence summary for valid agents.md
+            evidence_features = []
+            if has_sections:
+                evidence_features.append(f"{len(section_headers)} structured sections")
+            if has_endpoints:
+                evidence_features.append(f"{len(endpoint_urls) + len(inline_endpoints)} API endpoint declarations")
+            if raw_links:
+                evidence_features.append(f"{len(raw_links)} resource links")
+            if policy_links:
+                evidence_features.append(f"{len(policy_links)} policy links")
+            if has_commerce_protocol:
+                evidence_features.append("commerce protocol (UCP/MCP) support declared")
+        else:
+            # --- llms.txt format-specific checks ---
+            has_summary_quote = bool(re.search(r"^>\s+[^\n]+", content, re.MULTILINE))
+            if not has_summary_quote:
+                issues.append("missing blockquote summary ('> Brand Overview')")
+            if not raw_links:
+                issues.append("contains no structured markdown links to core resources")
+
+            evidence_features = []
+            if raw_links:
+                evidence_features.append(f"{len(raw_links)} structured resource links")
+
+        # Sample link targets to ensure they don't 404
+        dead_links = []
+        for title, link in raw_links[:3]:
+            full_link = urljoin(domain_root, link)
+            try:
+                chk = requests.head(full_link, headers=headers, timeout=3, allow_redirects=True)
+                if chk.status_code in {404, 410}:
+                    dead_links.append(f"{title} ({full_link})")
+            except requests.RequestException:
+                pass
+
+        if dead_links:
+            issues.append(f"contains dead internal links: {', '.join(dead_links)}")
+
+        # Check for companion llms-full.txt (only relevant for /llms.txt)
+        has_full_companion = False
+        if m_url.endswith("/llms.txt"):
+            try:
+                full_resp = requests.head(f"{domain_root}/llms-full.txt", headers=headers, timeout=2)
+                has_full_companion = (full_resp.status_code == 200)
+            except requests.RequestException:
+                pass
+
+        # Surface findings based on audit quality
+        if issues:
+            if is_agents_md:
+                action_summary = (
+                    f"Structure your {spec['label']} with a clear '# Store Name' heading, "
+                    "'## Section' headers for browsing endpoints, commerce protocols, and store policies. "
+                    "Include API endpoint declarations (e.g., 'GET /products/{{handle}}.json') and "
+                    "links to privacy/terms/refund policies."
+                )
+            else:
+                action_summary = (
+                    f"Align your {spec['label']} with the standardized format: start with '# Brand' and a '> Summary' quote, "
                     "followed by '## Section' headers and valid bulleted links: '- [Page Title](url): Description'."
+                )
+
+            findings.append({
+                "id": f"FEED-AI-MANIFEST-DEFECT-{id_suffix}",
+                "title": f"AI Manifest Found but Incomplete or Malformed ({spec['label']})",
+                "severity": "medium",
+                "evidence": f"Found manifest at {m_url}, but structural issues were detected: {'; '.join(issues)}.",
+                "suggested_action": {
+                    "summary": action_summary,
+                    "priority": "medium"
+                }
+            })
+        else:
+            companion_note = " Companion /llms-full.txt detected." if has_full_companion else ""
+            features_str = ", ".join(evidence_features) if evidence_features else "valid structure"
+            findings.append({
+                "id": f"FEED-AI-MANIFEST-VALID-{id_suffix}",
+                "title": f"Standardized AI Manifest Verified ({spec['label']})",
+                "severity": "info",
+                "evidence": (
+                    f"Successfully parsed {m_url}. Declares clean canonical H1, "
+                    f"{features_str}.{companion_note}"
                 ),
-                "priority": "medium"
-            }
-        })
-    else:
-        companion_note = " Companion /llms-full.txt detected." if has_full_companion else ""
-        findings.append({
-            "id": "FEED-AI-MANIFEST-VALID",
-            "title": "Standardized AI Manifest Verified",
-            "severity": "info",
-            "evidence": (
-                f"Successfully parsed {found_url}. Declares clean canonical H1, summary blockquote, "
-                f"and {len(raw_links)} structured resource links.{companion_note}"
-            ),
-            "suggested_action": None
-        })
+                "suggested_action": None
+            })
 
     return findings
 
