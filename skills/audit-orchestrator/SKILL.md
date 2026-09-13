@@ -25,7 +25,7 @@ This is the **primary entrypoint** for the marketplace. Users should invoke this
 6. **Skill invocation**: The orchestrator queries `marketplace.json` (or hardcoded defaults) and invokes eligible skills concurrently via `ThreadPoolExecutor` as independent subprocesses.
 7. **Skill suppression logic**: `ALWAYS_SAFE_SKILLS` run regardless of crawl quality. `PAGE_DEPENDENT_SKILLS` are suppressed if the crawl yielded too few usable pages (<3 usable pages and <40% usable ratio) to prevent false-positive hallucinations.
 8. **Data flow**: The orchestrator passes the `--url` and `--cache-dir` arguments to each skill script. Skills read from the cache and output JSON to `stdout`.
-9. **Deduplication**: Findings from all skills are aggregated and deduplicated based on the `id` field.
+9. **Deduplication**: Findings from all skills are aggregated and deduplicated in two passes: exact duplicate removal (same id/title/evidence), and cross-skill redundancy suppression (e.g. favoring `CRAWL-RENDER-CSR-RATIO` over `CEA-007` when both describe the same client-side rendering root cause).
 10. **Report construction**: Findings are sorted by severity. `critical`, `high`, `medium`, and `low` findings are placed in the `findings` array. `info` level findings are segregated into the `audit_notes` array. The orchestrator injects the `"skill"` field into every finding to track its origin.
 
 ## Output

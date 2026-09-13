@@ -38,6 +38,9 @@ Returns a JSON array of findings to stdout. Each finding contains:
 - **Machine-Readable URL Graph Detected (`FEED-SYNC-VALID`)**: Triggered if the sitemap parses successfully and contains one or more `<loc>` tags.
 - **Sitemap Exists but is Empty (`FEED-SYNC-EMPTY`)**: Triggered if the sitemap parses successfully but contains zero `<loc>` tags.
 - **Malformed XML Sitemap (`FEED-SYNC-MALFORMED`)**: Triggered if standard XML parsing fails on `sitemap.xml`.
+- **Standardized AI Manifest Verified (`FEED-AI-MANIFEST-VALID-*`)**: Triggered if `/llms.txt` or `/agents.md` are found and conform to their respective structural formats (e.g. `>` blockquote for llms.txt, `##` sections and commerce/API links for agents.md).
+- **AI Manifest Found but Incomplete or Malformed (`FEED-AI-MANIFEST-DEFECT-*`)**: Triggered if a manifest is found but lacks the required structural elements.
+- **Publish an AI-Specific Agent Manifest (`FEED-PROACTIVE-LLMSTXT`)**: Triggered if neither `/llms.txt` nor `/agents.md` is found.
 
 **Severity:**
 - **High**: Empty sitemap. The syndication feed is fundamentally broken.
