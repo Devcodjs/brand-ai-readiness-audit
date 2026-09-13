@@ -1,5 +1,5 @@
 ---
-name: Network Accessibility Audit
+name: network-accessibility-audit
 description: Analyzes how a brand's web properties handle access from AI search and training agents.
 license: MIT
 allowed-tools: [python]
