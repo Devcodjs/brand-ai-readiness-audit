@@ -632,6 +632,11 @@ def check_eng_broken_ctas(pages: list) -> dict | None:
     """ENG-DEAD-LINK-001: Live check of primary CTAs and navigation links for 404s."""
     broken_links = []
     
+    # Standard browser UA to avoid instant WAF blocks on Python-requests
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+    
     for page in pages:
         soup = page["soup"]
         base_url = page.get("final_url") or page["url"]
@@ -655,11 +660,14 @@ def check_eng_broken_ctas(pages: list) -> dict | None:
             if len(sampled_urls) >= 3:
                 break
                 
-        # Fast HEAD request to check for 404s
+        # Fast HEAD request to check for actual Not Found errors
         for target_url in sampled_urls:
             try:
-                resp = requests.head(target_url, timeout=3, allow_redirects=True)
-                if resp.status_code >= 400:
+                resp = requests.head(target_url, headers=headers, timeout=3, allow_redirects=True)
+                
+                # Strictly check for 404 (Not Found) or 410 (Gone).
+                # Do NOT flag 401, 403 (Forbidden/Blocked) or 429 (Rate Limited) as dead links.
+                if resp.status_code in {404, 410}:
                     broken_links.append({"source": base_url, "target": target_url, "status": resp.status_code})
             except requests.RequestException:
                 pass # Ignore timeouts/network failures; only flag confirmed HTTP errors
@@ -673,11 +681,14 @@ def check_eng_broken_ctas(pages: list) -> dict | None:
             "severity": severity,
             "evidence": (
                 f"Sampled primary interaction links (CTAs/nav) across the audited pages and found "
-                f"{len(broken_links)} dead internal link(s). Examples: {examples}. "
-                f"Visitors arriving via AI citations bounce immediately if their next logical click is broken."
+                f"{len(broken_links)} link(s) returning standard 'Not Found' HTTP errors. Examples: {examples}. "
+                f"NOTE: This check used an automated script. Some CDNs serve dynamic 404s to unrecognized bots."
             ),
             "suggested_action": {
-                "summary": "Fix or remove 404ing internal links. Implement a scalable broken-link monitoring tool in your CI/CD pipeline or CMS to prevent link rot.",
+                "summary": (
+                    "Verify that these targets are genuinely dead for human visitors. If confirmed, fix or remove "
+                    "the 404ing links. Visitors arriving via AI citations bounce immediately if their next logical click is broken."
+                ),
                 "priority": severity
             }
         }

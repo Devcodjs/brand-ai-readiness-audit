@@ -5,13 +5,11 @@ Design goals:
 - Evidence first: never turn a blocked/challenge/network-failed fetch into a
   semantic defect such as "missing schema".
 - Site-wide entity checks over a crawl manifest, with conservative fallbacks.
-- Detect Organization/Brand, sameAs, naming conflicts, Product coverage and
+- Detect Organization/Brand/Person/WebSite, sameAs, naming conflicts, Product coverage and
   malformed JSON-LD.
 - Return confidence/coverage metadata so the entrypoint can suppress weak
   findings.
 - Recommend-only and read-only; no site mutations.
-
-Compatible with the existing cache_index.json shape used by this marketplace.
 """
 
 from __future__ import annotations
@@ -20,35 +18,29 @@ import argparse
 import json
 import os
 import re
-import socket
-import ssl
 from collections import Counter, defaultdict
-from html import unescape
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
-from urllib.parse import urljoin, urlparse
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from urllib.parse import urlparse
 
 try:
     import requests
-except ImportError:  # pragma: no cover - environment-dependent
-    # If this dependency is missing in whatever sandbox runs the skill
-    # scripts, an unguarded `import requests` at module load time would
-    # raise before main()'s own try/except ever gets a chance to run,
-    # crashing the process with no stdout at all. From the orchestrator's
-    # side that is indistinguishable from this skill never being wired in
-    # -- so every use of `requests` below is guarded on this being None.
+except ImportError:
     requests = None  # type: ignore[assignment]
 
 try:
     from bs4 import BeautifulSoup
-except ImportError:  # pragma: no cover - environment-dependent
+except ImportError:
     BeautifulSoup = None  # type: ignore[assignment]
 
 
-ORG_TYPES = {"Organization", "Brand", "Corporation", "LocalBusiness"}
+# Broadened to support non-business sites (personal portfolios, wikis, editorial sites)
+CORE_ENTITY_TYPES = {"Organization", "Brand", "Corporation", "LocalBusiness", "Person", "WebSite", "NewsMediaOrganization"}
 PRODUCT_TYPES = {"Product", "ProductGroup"}
 PRODUCT_PAGE_TYPES = {"product"}
-REQUIRED_ORG_PROPS = ("name", "url", "logo")
+
+# Stripped down to universally required props for ANY core entity (Person/WebSite may not require a logo)
+REQUIRED_CORE_PROPS = ("name", "url")
 MIN_SAME_AS = 2
 USER_AGENT = "BrandAIReadinessAudit/2.0 (+read-only; no-site-changes)"
 DEFAULT_TIMEOUT = 12
@@ -173,12 +165,6 @@ def looks_like_challenge(
     return False, ""
 
 
-def _host_matches(url: str, expected_host: str) -> bool:
-    host = (urlparse(url).hostname or "").lower()
-    expected = (expected_host or "").lower()
-    return bool(host and expected and (host == expected or host.endswith("." + expected)))
-
-
 def _safe_fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
     try:
         resp = requests.get(
@@ -235,6 +221,28 @@ def _safe_fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
         "content_type": content_type,
     }
 
+def is_reference_or_wiki_page(html: str, url: str) -> bool:
+    """Positive-evidence check for encyclopedic/reference platforms."""
+    url_lower = (url or "").lower()
+    reference_domains = [
+        "wikipedia.org", "wikimedia.org", "wiktionary.org", 
+        "wikidata.org", "fandom.com", "wikivoyage.org"
+    ]
+    if any(d in url_lower for d in reference_domains):
+        return True
+
+    soup = BeautifulSoup(html or "", "html.parser")
+    generator = soup.find("meta", attrs={"name": "generator"})
+    if generator and "mediawiki" in (generator.get("content") or "").lower():
+        return True
+
+    body = soup.find("body")
+    if body:
+        body_classes = " ".join(body.get("class", [])).lower()
+        if "mediawiki" in body_classes:
+            return True
+
+    return False
 
 def load_manifest(cache_dir: str) -> dict:
     path = Path(cache_dir) / "cache_index.json"
@@ -251,7 +259,6 @@ def _page_is_usable(page: dict, html: Optional[str]) -> Tuple[bool, str]:
         return False, "missing_page_record"
     classification = _norm(page.get("content_classification")).lower()
     
-    # Explicit bypass based on classification
     if classification in {"blocked", "bot_challenge", "challenge", "auth_wall", "access_denied", "captcha"}:
         return False, f"classified_as_{classification}"
     
@@ -288,24 +295,24 @@ def _same_as_values(schema: dict) -> Set[str]:
     return out
 
 
-def _org_schema_summary(nodes: Sequence[dict]) -> Dict[str, Any]:
-    org_nodes = []
+def _core_schema_summary(nodes: Sequence[dict]) -> Dict[str, Any]:
+    core_nodes = []
     for node in nodes:
-        if _types_of(node) & ORG_TYPES:
-            org_nodes.append(node)
-    names = {_norm(n.get("name")) for n in org_nodes if _norm(n.get("name"))}
+        if _types_of(node) & CORE_ENTITY_TYPES:
+            core_nodes.append(node)
+    names = {_norm(n.get("name")) for n in core_nodes if _norm(n.get("name"))}
     same_as = set()
     missing = defaultdict(int)
     urls = set()
-    for node in org_nodes:
+    for node in core_nodes:
         same_as.update(_same_as_values(node))
         if _norm(node.get("url")):
             urls.add(_norm(node.get("url")))
-        for prop in REQUIRED_ORG_PROPS:
+        for prop in REQUIRED_CORE_PROPS:
             if not node.get(prop):
                 missing[prop] += 1
     return {
-        "count": len(org_nodes),
+        "count": len(core_nodes),
         "names": names,
         "same_as": same_as,
         "missing": dict(missing),
@@ -359,7 +366,7 @@ def _fallback_single_page(target_url: str) -> Tuple[List[dict], Dict[str, Any]]:
             "No JSON-LD Structured Data Observed",
             "high",
             f"1 normal HTML page was fetched successfully from {target_url}, but no application/ld+json nodes were found.",
-            "Add machine-readable JSON-LD for the page's core entity (Organization/Brand) and relevant content types; keep the values consistent with visible page content.",
+            "Install an SEO plugin or configure your global <Head> component to auto-inject a standard core JSON-LD schema (e.g. Organization, Person, or WebSite) sitewide.",
             "high",
         ))
     elif malformed:
@@ -368,18 +375,18 @@ def _fallback_single_page(target_url: str) -> Tuple[List[dict], Dict[str, Any]]:
             "Malformed JSON-LD Detected",
             "medium",
             f"The fetched page contains {malformed} application/ld+json script(s) that could not be parsed as JSON.",
-            "Fix JSON syntax and validate the final JSON-LD after deployment so machine readers can parse the entity graph.",
+            "If maintaining raw JSON strings is causing syntax errors, use a schema-builder library (like schema-dts for React/TypeScript) or your framework's native SEO module to programmatically generate type-safe JSON-LD.",
             "medium",
         ))
 
-    summary = _org_schema_summary(nodes)
+    summary = _core_schema_summary(nodes)
     if summary["count"] == 0 and nodes:
         findings.append(_finding(
             "ENTITY-HIGH-002",
-            "Core Organization/Brand Entity Not Declared",
+            "Core Canonical Entity Not Declared",
             "high",
-            f"Structured data was present on the normal page, but no Organization, Brand, Corporation, or LocalBusiness node was found ({len(nodes)} schema node(s) parsed).",
-            "Add a canonical Organization/Brand node with stable name, URL and logo, and link it consistently from the site's relevant structured-data nodes.",
+            f"Structured data was present on the normal page, but no Organization, Brand, Person, or WebSite node was found ({len(nodes)} schema node(s) parsed).",
+            "Update your global template header or CMS settings to emit a sitewide core JSON-LD node (e.g. Organization or Person). Centralize this data so AI agents have a stable canonical identity to map across the knowledge graph.",
             "high",
         ))
 
@@ -388,7 +395,7 @@ def _fallback_single_page(target_url: str) -> Tuple[List[dict], Dict[str, Any]]:
             "id": "ENTITY-PASS-000",
             "title": "Core Entity Schema Observed",
             "severity": "info",
-            "evidence": f"A normal page was fetched and machine-readable schema was parsed successfully; {summary['count']} organization/brand node(s) and {len(summary['same_as'])} sameAs link(s) were observed.",
+            "evidence": f"A normal page was fetched and machine-readable schema was parsed successfully; {summary['count']} core entity node(s) and {len(summary['same_as'])} sameAs link(s) were observed.",
             "suggested_action": None,
         })
     return findings, meta
@@ -412,7 +419,7 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
         try:
             html, load_error = _load_page_html(page)
             usable, reason = _page_is_usable(page, html)
-        except Exception as exc:  # a single malformed manifest entry should not abort the whole audit
+        except Exception as exc:
             unusable_reasons[f"page_processing_error:{type(exc).__name__}"] += 1
             continue
         if usable and html is not None:
@@ -438,7 +445,7 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
                     "Entity Audit Suppressed: No Normal HTML Evidence",
                     "high",
                     f"The crawl manifest contained {len(raw_pages)} page(s), but 0 were usable normal HTML. Reasons observed: {dict(unusable_reasons) or 'unknown'}.",
-                    "Restore access to representative normal pages before drawing conclusions about JSON-LD, Organization schema, Product schema, or sameAs coverage.",
+                    "Restore access to representative normal pages before drawing conclusions about JSON-LD or entity schema.",
                     "high",
                 )
             ],
@@ -447,16 +454,16 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
         }
 
     all_same_as: Set[str] = set()
-    org_names: Set[str] = set()
-    org_missing_props: defaultdict[str, List[str]] = defaultdict(list)
+    core_names: Set[str] = set()
+    core_missing_props: defaultdict[str, List[str]] = defaultdict(list)
     product_pages_checked = 0
     product_pages_missing_schema: List[str] = []
     product_pages_with_schema = 0
     malformed_pages: List[str] = []
     pages_with_jsonld = 0
-    pages_with_org = 0
+    pages_with_core = 0
     page_schema_counts = Counter()
-    org_urls: Set[str] = set()
+    core_urls: Set[str] = set()
     page_processing_errors: List[str] = []
 
     for page, html in pages:
@@ -471,15 +478,15 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
             if malformed:
                 malformed_pages.append(page_url)
 
-            org = _org_schema_summary(nodes)
-            if org["count"]:
-                pages_with_org += 1
-                all_same_as.update(org["same_as"])
-                org_names.update(org["names"])
-                org_urls.update(org["urls"])
-                for prop in REQUIRED_ORG_PROPS:
-                    if org["missing"].get(prop):
-                        org_missing_props[prop].append(page_url)
+            core_ent = _core_schema_summary(nodes)
+            if core_ent["count"]:
+                pages_with_core += 1
+                all_same_as.update(core_ent["same_as"])
+                core_names.update(core_ent["names"])
+                core_urls.update(core_ent["urls"])
+                for prop in REQUIRED_CORE_PROPS:
+                    if core_ent["missing"].get(prop):
+                        core_missing_props[prop].append(page_url)
 
             page_type = _norm(page.get("page_type")).lower()
             is_product = page_type in PRODUCT_PAGE_TYPES
@@ -494,15 +501,12 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
                 else:
                     product_pages_missing_schema.append(page_url)
         except Exception as exc:
-            # A single page's unexpected shape (e.g. schema extraction choking
-            # on it) should degrade to "one page skipped", not abort the audit
-            # and return nothing for the whole site.
             page_processing_errors.append(f"{page_url} ({type(exc).__name__})")
             continue
 
     evidence.update({
         "pages_with_jsonld": pages_with_jsonld,
-        "pages_with_org_schema": pages_with_org,
+        "pages_with_core_schema": pages_with_core,
         "product_pages_checked": product_pages_checked,
         "product_pages_with_schema": product_pages_with_schema,
         "schema_type_counts": dict(page_schema_counts),
@@ -511,58 +515,75 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
 
     findings: List[dict] = []
 
+    # Check if this is a wiki platform based on the first usable page
+    is_wiki = False
+    if pages:
+        is_wiki = is_reference_or_wiki_page(pages[0][1], pages[0][0].get("url", ""))
+
     if pages_with_jsonld == 0:
-        findings.append(_finding(
-            "ENTITY-HIGH-001",
-            "No JSON-LD Structured Data Observed",
-            "high",
-            f"Scanned {len(pages)} normal HTML pages; 0 contained parseable application/ld+json nodes.",
-            "Add JSON-LD for the site's core entity and key page types, with values that match visible page content. Prioritize Organization/Brand, WebSite/WebPage and Product where applicable.",
-            "high",
-        ))
+        if is_wiki:
+            findings.append({
+                "id": "ENTITY-INFO-WIKI-001",
+                "title": "Reference/Wiki Site Detected without JSON-LD",
+                "severity": "info",
+                "evidence": f"Scanned {len(pages)} normal HTML pages. No JSON-LD observed, but reference platform markers (MediaWiki/Wikipedia) were detected. AI models natively understand wiki structures without corporate schema.",
+                "suggested_action": None
+            })
+        else:
+            findings.append(_finding(
+                "ENTITY-HIGH-001",
+                "No JSON-LD Structured Data Observed",
+                "high",
+                f"Scanned {len(pages)} normal HTML pages; 0 contained parseable application/ld+json nodes.",
+                "Install an SEO plugin (e.g. Yoast/RankMath) or configure your global <Head> component (Next.js/Nuxt) to auto-inject a standard Organization, Person, or WebSite schema sitewide.",
+                "high",
+            ))
 
-    if pages_with_org == 0 and pages_with_jsonld > 0:
-        findings.append(_finding(
-            "ENTITY-HIGH-002",
-            "No Core Organization/Brand Entity in Structured Data",
-            "high",
-            f"Structured data was observed on {pages_with_jsonld}/{len(pages)} normal pages, but 0 Organization/Brand/Corporation/LocalBusiness nodes were found.",
-            "Declare one canonical Organization/Brand node with stable name, URL and logo, and reference that entity consistently from relevant page schemas.",
-            "high",
-        ))
+    if pages_with_core == 0 and pages_with_jsonld > 0:
+        if not is_wiki: # Only flag the defect if it's NOT a wiki
+            findings.append(_finding(
+                "ENTITY-HIGH-002",
+                "No Canonical Brand, Organization, or Website Entity Declared",
+                "high",
+                f"Structured data was observed on {pages_with_jsonld}/{len(pages)} normal pages, but 0 core entity nodes (Organization, Brand, Person, or WebSite) were found.",
+                "Declare one canonical core entity node with a stable name and URL. Centralize this data in your CMS configuration so AI agents have a stable canonical identity to map across the knowledge graph.",
+                "high",
+            ))
 
-    if pages_with_org > 0:
+    if pages_with_core > 0:
         if len(all_same_as) < MIN_SAME_AS:
             findings.append(_finding(
                 "ENTITY-MED-003",
-                "Weak External Entity Consensus",
+                "Weak External Entity Consensus (sameAs)",
                 "medium",
-                f"Organization/Brand schema was found on {pages_with_org}/{len(pages)} normal pages, but only {len(all_same_as)} unique sameAs link(s) were declared.",
-                "Add only unambiguous official identity links such as the brand's official social profiles and, where the entity is clearly matched, Wikidata/Wikipedia or another authoritative profile. Do not add unrelated third-party pages merely to increase the count.",
+                f"Core schema was found on {pages_with_core}/{len(pages)} normal pages, but only {len(all_same_as)} unique sameAs link(s) were declared.",
+                "Populate the sameAs array in your global JSON-LD component with your verified social profiles, Wikipedia page, and Wikidata item. This cross-linking establishes 'entity equivalence', merging your site with your broader web footprint in AI knowledge graphs.",
                 "medium",
             ))
 
-        if org_names and len(org_names) > 1:
+        if core_names and len(core_names) > 1:
             findings.append(_finding(
                 "ENTITY-MED-005",
-                "Inconsistent Organization Name Across Pages",
+                "Inconsistent Entity Name Across Pages",
                 "medium",
-                f"Organization/Brand nodes declare {len(org_names)} distinct name value(s): {sorted(org_names)}.",
-                "Standardize the canonical Organization/Brand name across templates. Preserve legitimate brand/sub-brand distinctions by using separate entities rather than alternating names on one entity.",
+                f"Core identity nodes declare {len(core_names)} distinct name value(s): {sorted(core_names)}.",
+                "Centralize your primary entity name string in a single environment variable or CMS global setting, and pass it to all schema templates. This prevents template drift from fragmenting your entity in AI knowledge graphs.",
                 "medium",
             ))
 
-        missing_prop_list = [prop for prop in REQUIRED_ORG_PROPS if org_missing_props.get(prop)]
+        missing_prop_list = [prop for prop in REQUIRED_CORE_PROPS if core_missing_props.get(prop)]
         if missing_prop_list:
             evidence_parts = []
             for prop in missing_prop_list:
-                evidence_parts.append(f"'{prop}' missing on {len(org_missing_props[prop])} page(s), e.g. {org_missing_props[prop][0]}")
+                affected_urls = core_missing_props[prop]
+                evidence_parts.append(f"'{prop}' missing on {len(affected_urls)} page(s) (e.g., {affected_urls[0]})")
+                
             findings.append(_finding(
                 "ENTITY-MED-004",
-                "Organization Entity Nodes Are Incomplete",
+                "Core Entity Nodes Are Missing Critical Props",
                 "medium",
-                "; ".join(evidence_parts),
-                "Keep the canonical Organization node complete with name, URL and logo where applicable, and avoid emitting partial duplicate organization nodes across templates.",
+                "; ".join(evidence_parts) + ".",
+                "Centralize your core entity definition into a single globally imported object or CMS field (Name, Canonical URL). Pass this variable to your schema generator to instantly eliminate partial or fragmented entity nodes sitewide.",
                 "medium",
             ))
 
@@ -575,7 +596,7 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
                 "Product Pages Missing Product Structured Data",
                 severity,
                 f"{missing}/{product_pages_checked} product-type pages lacked a Product/ProductGroup JSON-LD node. Examples: {', '.join(product_pages_missing_schema[:5])}.",
-                "Add Product/ProductGroup structured data to product templates with truthful product name, image, SKU/identifier and Offer data where available. Keep availability and price synchronized with the rendered page.",
+                "Map your PIM (Product Information Management) system or e-commerce database directly to a global <ProductSchema /> component. Auto-populate @type, price, and availability dynamically so AI agents always scrape real-time commerce data.",
                 severity,
             ))
 
@@ -585,38 +606,51 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
             "Malformed JSON-LD Found",
             "medium",
             f"{len(malformed_pages)} normal page(s) contained at least one application/ld+json block that could not be parsed as JSON. Example: {malformed_pages[0]}.",
-            "Fix malformed JSON-LD blocks and validate them in CI so the machine-readable graph remains parseable after template changes.",
+            "If maintaining raw JSON strings is causing syntax errors, use a schema-builder library (like schema-dts for React/TypeScript) or your framework's native SEO module to programmatically generate type-safe JSON-LD.",
             "medium",
         ))
 
-    if pages_with_org and len(all_same_as) >= MIN_SAME_AS and not org_names:
+    if pages_with_core and len(all_same_as) >= MIN_SAME_AS and not core_names:
         findings.append(_finding(
             "ENTITY-PROACTIVE-008",
-            "Entity Coverage Is Present but Could Be Cross-Linked More Strongly",
+            "Entity Coverage Is Present but Lacks a Concrete Name",
             "info",
-            f"A core Organization/Brand schema was observed with {len(all_same_as)} sameAs link(s), but no non-empty Organization name value was parsed for the sampled nodes.",
-            "Make the canonical entity name explicit and stable, and keep identity links consistent across templates.",
+            f"A core schema was observed with {len(all_same_as)} sameAs link(s), but no non-empty name value was parsed.",
+            "Make the canonical entity name explicit and stable to ensure reliable AI agent attribution.",
             "low",
         ))
 
     if not findings:
-        findings.append({
-            "id": "ENTITY-PASS-000",
-            "title": "Robust Semantic Entity Graph Observed",
-            "severity": "info",
-            "evidence": (
-                f"Verified {pages_with_org} page(s) with Organization/Brand schema across {len(pages)} normal pages, "
-                f"{len(all_same_as)} unique sameAs link(s), consistent organization naming, and no malformed JSON-LD on sampled pages."
-            ),
-            "suggested_action": None,
-        })
+        if is_wiki:
+            findings.append({
+                "id": "ENTITY-PASS-WIKI-000",
+                "title": "Reference/Wiki Discoverability Verified",
+                "severity": "info",
+                "evidence": (
+                    f"Scanned {len(pages)} normal HTML page(s). Reference platform markers were detected. "
+                    "Corporate JSON-LD (Organization/Brand) is not required here; AI models natively "
+                    "ingest and understand encyclopedic architecture without explicit entity schema."
+                ),
+                "suggested_action": None,
+            })
+        else:
+            findings.append({
+                "id": "ENTITY-PASS-000",
+                "title": "Robust Semantic Entity Graph Observed",
+                "severity": "info",
+                "evidence": (
+                    f"Verified {pages_with_core} page(s) with core entity schema across {len(pages)} normal pages, "
+                    f"{len(all_same_as)} unique sameAs link(s), consistent entity naming, and no malformed JSON-LD."
+                ),
+                "suggested_action": None,
+            })
 
     proactive = []
     if pages_with_jsonld and not page_schema_counts.get("WebPage"):
         proactive.append({
             "id": "PROACTIVE-WEBPAGE-001",
             "title": "Add WebPage-level structured context",
-            "summary": "Use WebPage/CollectionPage/Article/Product schema where appropriate so page purpose is explicit and machine-readable.",
+            "summary": "Use WebPage/CollectionPage/Article schema where appropriate so page purpose is explicit and machine-readable.",
             "priority": "low",
         })
     if product_pages_checked == 0:
@@ -635,14 +669,6 @@ def validate_entity_graph(target_url: str, cache_dir: str = "audit-cache") -> Di
 
 
 def _fatal_result(target_url: str, exc: BaseException) -> Dict[str, Any]:
-    """Last-resort payload so the orchestrator always gets parseable JSON,
-    even if something outside this module's control (bad args, an
-    unexpected manifest shape, a missing dependency) blows up before the
-    normal findings/evidence logic can run. A crashed process that prints
-    a traceback and exits non-zero looks, from the orchestrator's side,
-    identical to a skill that was never invoked at all -- this keeps that
-    failure mode from being silent.
-    """
     return {
         "findings": [
             _finding(
@@ -661,17 +687,13 @@ def _fatal_result(target_url: str, exc: BaseException) -> Dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Validate site entity graph from a crawl manifest.")
-    # Primary flags, plus tolerant aliases: if the orchestrator's dispatcher
-    # calls every skill with a slightly different flag-naming convention,
-    # these still resolve to the same dest instead of failing argument
-    # parsing outright.
     parser.add_argument("--url", "--target-url", "--site-url", dest="url", required=True, help="Target website URL")
     parser.add_argument("--cache-dir", "--cache_dir", dest="cache_dir", default="audit-cache", help="Directory containing cache_index.json")
     args, _unknown = parser.parse_known_args()
 
     try:
         result = validate_entity_graph(args.url, cache_dir=args.cache_dir)
-    except Exception as exc:  # noqa: BLE001 - last line of defense, see _fatal_result
+    except Exception as exc: 
         result = _fatal_result(args.url, exc)
 
     print(json.dumps(result["findings"], indent=2, ensure_ascii=False))

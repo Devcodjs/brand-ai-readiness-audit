@@ -114,10 +114,10 @@ def check_page_weight(pages, findings):
                 "title": "Bloated Raw HTML Payload",
                 "severity": severity,
                 "evidence": (
-                    f"{len(heavy_pages)}/{len(pages)} page(s) served raw HTML \u2265900KB "
+                    f"{len(heavy_pages)}/{len(pages)} page(s) served raw HTML >=900KB "
                     f"before any external asset loads; worst case {worst[0]} at "
                     f"{worst[1]/1_000_000:.1f}MB. Measured from the server-delivered "
-                    f"document only — real total page weight is at least this large."
+                    f"document only - real total page weight is at least this large."
                 ),
                 "suggested_action": {
                     "summary": (
@@ -239,15 +239,34 @@ def check_mobile_viewport(pages, findings):
     try:
         missing, broken, zoom_disabled = [], [], []
         for page in pages:
-            tag = page["soup"].find("meta", attrs={"name": "viewport"})
+            soup = page.get("soup")
+            if not soup:
+                continue
+                
+            # Case-insensitive match to handle <meta name="Viewport"> variants gracefully
+            tag = soup.find("meta", attrs={"name": re.compile(r"^viewport$", re.I)})
+            
             if not tag or not tag.get("content"):
                 missing.append(page["url"])
                 continue
+                
             content = tag["content"].lower()
-            if "width=device-width" not in content.replace(" ", ""):
+            content_no_spaces = content.replace(" ", "")
+            
+            # Check for standard responsive width mapping
+            if "width=device-width" not in content_no_spaces:
                 broken.append(page["url"])
+                
+            # Check for accessibility/zoom restrictions
             if re.search(r'user-scalable\s*=\s*no', content) or re.search(r'maximum-scale\s*=\s*1(\.0)?\b', content):
                 zoom_disabled.append(page["url"])
+
+        # The Observation Hedge: We used a Desktop UA, so adaptive sites will naturally fail this.
+        desktop_ua_caveat = (
+            "NOTE: This crawl used a desktop User-Agent. If your site uses server-side adaptive "
+            "delivery (serving different HTML/templates to mobile devices) rather than responsive CSS, "
+            "this may be a false positive."
+        )
 
         if missing:
             severity = "high" if len(missing) / len(pages) >= 0.5 else "medium"
@@ -255,35 +274,54 @@ def check_mobile_viewport(pages, findings):
                 "id": "ENG-VIEWPORT-001",
                 "title": "Missing Mobile Viewport Meta Tag",
                 "severity": severity,
-                "evidence": f"{len(missing)}/{len(pages)} page(s) have no <meta name=\"viewport\">, e.g. {missing[0]}.",
+                "evidence": (
+                    f"{len(missing)}/{len(pages)} sampled page(s) lack a <meta name=\"viewport\"> tag. "
+                    f"{desktop_ua_caveat} Examples: {', '.join(missing[:3])}."
+                ),
                 "suggested_action": {
-                    "summary": "Add <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"> to every page template.",
+                    "summary": (
+                        "Verify whether this omission is an artifact of adaptive desktop delivery. "
+                        "If your site relies on responsive design (serving the same HTML to all devices), "
+                        "you must add <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"> "
+                        "to your global <head> to ensure mobile readability."
+                    ),
                     "priority": severity,
                 },
             })
+            
         if broken:
             severity = "high" if len(broken) / len(pages) >= 0.5 else "medium"
             findings.append({
                 "id": "ENG-VIEWPORT-002",
                 "title": "Viewport Meta Tag Missing width=device-width",
                 "severity": severity,
-                "evidence": f"{len(broken)}/{len(pages)} page(s) declare a viewport tag without width=device-width, e.g. {broken[0]}.",
+                "evidence": (
+                    f"{len(broken)}/{len(pages)} sampled page(s) declare a viewport tag, but omit the 'width=device-width' "
+                    f"directive required for fluid responsive scaling. {desktop_ua_caveat} Examples: {', '.join(broken[:3])}."
+                ),
                 "suggested_action": {
-                    "summary": "Set content=\"width=device-width, initial-scale=1\" explicitly.",
+                    "summary": (
+                        "Verify whether this omission is an artifact of adaptive desktop delivery. "
+                        "If your site is responsive, explicitly set content=\"width=device-width, initial-scale=1\" "
+                        "in your viewport tag so AI-referred mobile visitors don't bounce due to horizontal scrolling."
+                    ),
                     "priority": severity,
                 },
             })
+            
         if zoom_disabled:
+            # Zoom restrictions are unconditionally bad for accessibility regardless of adaptive/responsive delivery
             findings.append({
                 "id": "ENG-VIEWPORT-003",
                 "title": "Pinch-Zoom Disabled in Viewport Meta Tag",
                 "severity": "medium",
-                "evidence": f"{len(zoom_disabled)}/{len(pages)} page(s) set user-scalable=no or maximum-scale=1, e.g. {zoom_disabled[0]}.",
+                "evidence": f"{len(zoom_disabled)}/{len(pages)} sampled page(s) restrict zooming by setting user-scalable=no or maximum-scale=1. Examples: {', '.join(zoom_disabled[:3])}.",
                 "suggested_action": {
-                    "summary": "Remove user-scalable=no / maximum-scale restrictions so visitors can zoom.",
+                    "summary": "Remove 'user-scalable=no' and 'maximum-scale' restrictions from your viewport tag. Disabling pinch-to-zoom is a W3C accessibility violation and degrades mobile engagement.",
                     "priority": "medium",
                 },
             })
+            
     except Exception as e:
         sys.stderr.write(f"Error in ENG-VIEWPORT checks: {e}\n")
 

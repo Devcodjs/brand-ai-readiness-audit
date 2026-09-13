@@ -252,35 +252,64 @@ def check_cea_005(pages: list) -> dict | None:
     img_count = 0
     affected_urls = set()
     examples = set()
-    keywords = ["table", "spec", "chart", "comparison", "pricing", "schedule", "menu", "rate", "plan"]
+    
+    # 1. Upgrade to strict compound patterns and word boundaries to prevent substring false positives
+    # (e.g., prevents "planet" from matching "plan", or "spectacles" from matching "spec")
+    data_image_patterns = re.compile(
+        r"\b(pricing[-_]?table|comparison[-_]?chart|rate[-_]?card|spec[-_]?sheet|"
+        r"nutrition[-_]?facts|size[-_]?guide|fee[-_]?schedule|feature[-_]?matrix|"
+        r"data[-_]?table|infographic)\b",
+        re.I
+    )
 
     for page in pages:
         soup = page["soup"]
-        images = soup.find_all("img")
-        for img in images:
-            src = img.get("src", "").lower()
-            alt = img.get("alt", "").lower()
-            if any(kw in src or kw in alt for kw in keywords):
+        for img in soup.find_all("img"):
+            # 2. Exclude images inside standard UI containers to avoid flagging hamburger menus or nav icons
+            if img.find_parent(["nav", "header", "footer", "button", "aside"]):
+                continue
+                
+            # 3. Exclude explicitly small decorative icons if dimensions are present
+            w = img.get("width")
+            h = img.get("height")
+            if (w and str(w).isdigit() and int(w) < 100) or (h and str(h).isdigit() and int(h) < 100):
+                continue
+
+            src = img.get("src", "")
+            alt = img.get("alt", "")
+            
+            match = data_image_patterns.search(src) or data_image_patterns.search(alt)
+            
+            if match:
                 parent = img.parent
-                if parent:
-                    if not parent.find(["table", "dl"]):
-                        img_count += 1
-                        affected_urls.add(page["url"])
-                        match = [kw for kw in keywords if kw in src or kw in alt]
-                        if match:
-                            examples.add(match[0])
+                # If there's an adjacent or parent table/dl, it already has an accessible fallback
+                if parent and not parent.find(["table", "dl"]):
+                    img_count += 1
+                    affected_urls.add(page["url"])
+                    examples.add(match.group(0).lower())
 
     if img_count > 0:
         ratio = len(affected_urls) / len(pages)
-        severity = "high" if ratio > 0.3 else "medium"
-        example = list(examples)[0] if examples else "table"
+        
+        # 4. Downgrade severity. A filename heuristic should never trigger a High severity defect.
+        severity = "medium" if ratio > 0.3 else "low"
+        example = list(examples)[0] if examples else "chart"
+        
         return {
             "id": "CEA-005",
             "title": "Data Tables as Images",
             "severity": severity,
-            "evidence": f"Found {img_count} images with data-suggestive filenames/alt text (e.g., '{example}') without adjacent <table> or <dl> markup on {len(affected_urls)} pages.",
+            "evidence": (
+                f"Found {img_count} image(s) with data-suggestive filenames or alt text (e.g., '{example}') "
+                f"without adjacent <table> or <dl> markup across {len(affected_urls)} page(s). "
+                f"NOTE: This observation relies on a filename/alt-text heuristic, not visual analysis. It may flag unrelated diagrams."
+            ),
             "suggested_action": {
-                "summary": "Replace image-based data presentations with semantic HTML <table> or <dl> elements. Keep the image as a visual supplement but ensure the data is also available as structured text.",
+                "summary": (
+                    "Verify if these flagged images contain structured data (like pricing matrices, schedules, or specs). "
+                    "If they do, replace or supplement them with semantic HTML <table> or <dl> elements so AI parsers can "
+                    "accurately extract the numbers."
+                ),
                 "priority": severity
             }
         }

@@ -368,7 +368,7 @@ class SiteCrawler:
 
         self.crawl_delay = 0.0
         self.last_pivot_diagnostics = None
-        self.robots_unavailable = False  # Track if we need to fail-open
+        self.robots_unavailable = False  
 
     def reset_cache_dir(self):
         if CACHE_DIR.exists():
@@ -460,7 +460,6 @@ class SiteCrawler:
                     ] = self.crawl_delay
 
             else:
-                # Explicitly fail-open if the file is absent (404) or blocked (403/429)
                 self.robots_unavailable = True
                 
                 if robots_resp.status_code in (401, 403, 429, 500, 502, 503, 504):
@@ -543,13 +542,10 @@ class SiteCrawler:
         url: str,
         user_agent: str = "*",
     ) -> bool:
-        # Explicit fail-open if robots.txt was not successfully processed or was unavailable
         if getattr(self, "robots_unavailable", False):
             return True
             
         try:
-            # urllib.robotparser fails closed (returns False) if .parse() was never called
-            # (i.e. self.last_checked == 0). Ensure we fail open if the parser is uninitialized.
             if not getattr(self.robot_parser, "last_checked", 0):
                 return True
             return self.robot_parser.can_fetch(user_agent, url)
@@ -611,16 +607,48 @@ class SiteCrawler:
 
         return sorted(discovered)
 
+    def _read_ai_manifest_urls(self) -> list[str]:
+        """
+        Fetch /llms.txt and /agents.md, parse markdown links to populate 
+        an explicitly curated priority queue for the crawler.
+        """
+        manifest_urls = [f"{self.domain_root}/llms.txt", f"{self.domain_root}/agents.md"]
+        extracted = []
+        
+        headers = REQUEST_HEADERS.copy()
+        headers["Accept"] = "text/markdown, text/plain, */*"
+        
+        for m_url in manifest_urls:
+            try:
+                resp = requests.get(m_url, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+                if resp.status_code == 200:
+                    body = resp.text.strip()
+                    ct = resp.headers.get("Content-Type", "").lower()
+                    
+                    # Reject SPA HTML catch-alls
+                    if "text/html" in ct or body.startswith("<!doctype") or "<html" in body[:200].lower():
+                        continue
+                    
+                    # Store the valid manifest in the cache directory
+                    filename = m_url.split("/")[-1]
+                    (CACHE_DIR / filename).write_text(body, encoding="utf-8")
+                        
+                    # Extract markdown links: [Title](url)
+                    raw_links = re.findall(r"\[[^\]]+\]\((https?://[^\s\)]+|/[^\s\)]+)\)", body)
+                    for link in raw_links:
+                        full_url = normalize_url(urljoin(self.domain_root, link))
+                        parsed = urlparse(full_url)
+                        if parsed.netloc == urlparse(self.domain_root).netloc and is_auditable_html(full_url):
+                            if self.is_allowed(full_url):
+                                extracted.append(full_url)
+            except requests.RequestException:
+                continue
+                
+        return sorted(set(extracted))
+
     def _read_sitemap_urls(
         self,
     ) -> list[str]:
-        """
-        Reads cached sitemap.xml.
-
-        For a sitemap index, fetch ALL child sitemaps rather than limiting
-        discovery to the first few. The resulting URLs are discovery evidence;
-        page fetching remains bounded by max_pages.
-        """
         sitemap_path = (
             CACHE_DIR / "sitemap.xml"
         )
@@ -634,7 +662,6 @@ class SiteCrawler:
                     encoding="utf-8"
                 )
             )
-
         except (
             ET.ParseError,
             OSError,
@@ -642,7 +669,6 @@ class SiteCrawler:
             return []
 
         urls = []
-
         is_index = root.tag.endswith(
             "sitemapindex"
         )
@@ -665,7 +691,6 @@ class SiteCrawler:
                     if self.is_allowed(normalized):
                         urls.append(normalized)
 
-        # Handle Sitemap Index
         if is_index and urls:
 
             def sitemap_priority(
@@ -675,22 +700,18 @@ class SiteCrawler:
 
                 if "product" in u_low:
                     return 0
-
                 if (
                     "collection" in u_low
                     or "category" in u_low
                 ):
                     return 1
-
                 if (
                     "blog" in u_low
                     or "article" in u_low
                 ):
                     return 2
-
                 if "page" in u_low:
                     return 3
-
                 return 4
 
             child_sitemaps = sorted(
@@ -700,8 +721,6 @@ class SiteCrawler:
 
             extracted_html_urls = []
 
-            # IMPORTANT:
-            # No [:4] here.
             for child_url in child_sitemaps:
                 try:
                     resp = requests.get(
@@ -756,7 +775,6 @@ class SiteCrawler:
                                 extracted_html_urls.append(
                                     norm
                                 )
-
                 except Exception:
                     continue
 
@@ -764,7 +782,6 @@ class SiteCrawler:
                 set(extracted_html_urls)
             )
 
-        # Standard URL set
         return sorted(
             set(
                 u
@@ -776,13 +793,16 @@ class SiteCrawler:
     def prioritized_urls(
         self,
         candidates: Iterable[str],
+        priority_seeds: set = None
     ) -> list[str]:
         """
-        Deduplicate and sort candidate URLs according to architectural quotas
-        to ensure diverse page-type representation across categories.
+        Deduplicate and sort candidate URLs according to architectural quotas.
+        If priority_seeds (like LLM manifests) are provided, they unconditionally
+        bypass quotas and are hoisted to the front of the queue.
         """
         unique = []
         seen = set()
+        priority_seeds = priority_seeds or set()
 
         for raw in candidates:
             normalized = normalize_url(raw)
@@ -812,6 +832,10 @@ class SiteCrawler:
             seen.add(normalized)
             unique.append(normalized)
 
+        # Force AI-curated seeds to the very front
+        forced_front = [u for u in unique if u in priority_seeds]
+        general_pool = [u for u in unique if u not in priority_seeds]
+
         buckets = {
             kind: []
             for kind in (
@@ -825,7 +849,7 @@ class SiteCrawler:
             )
         }
 
-        for url in unique:
+        for url in general_pool:
             buckets[
                 classify_url(url)
             ].append(url)
@@ -839,28 +863,27 @@ class SiteCrawler:
             "other": 2,
         }
 
-        selected = []
+        selected_general = []
 
         for kind, limit in quota.items():
-            selected.extend(
+            selected_general.extend(
                 buckets[kind][:limit]
             )
 
-        selected_set = set(selected)
+        selected_set = set(selected_general)
 
         leftovers = [
             u
-            for u in unique
+            for u in general_pool
             if u not in selected_set
         ]
 
-        return selected + leftovers
+        return forced_front + selected_general + leftovers
 
     def sample_urls(
         self,
         candidates: Iterable[str],
     ) -> list[str]:
-        """Legacy compatibility method returning top-quota sampled URLs."""
         return self.prioritized_urls(
             candidates
         )[
@@ -972,13 +995,11 @@ class SiteCrawler:
             "other_netloc_counts": other_counts,
         }
 
-        # Pattern 1: Diffuse fan-out portal
         is_diffuse_fanout = (
             len(other_counts)
             >= MIN_DISTINCT_SUBDOMAINS_FOR_FANOUT
         )
 
-        # Protect enterprise mega-menus from portal classification.
         PORTAL_MAX_SELF_LINKS = 10
 
         if (
@@ -1007,7 +1028,6 @@ class SiteCrawler:
                 f"https://{best_netloc}"
             )
 
-        # Pattern 2 gate
         if (
             current_count
             >= MIN_SELF_LINKS_TO_SKIP_PIVOT
@@ -1022,7 +1042,6 @@ class SiteCrawler:
 
             return None
 
-        # Pattern 2: Dominant cluster
         best_netloc = None
         best_count = 0
 
@@ -1120,7 +1139,6 @@ class SiteCrawler:
                 )
             )
 
-            # --- NEW: Capture Redirect Chain Telemetry ---
             if resp.history:
                 record["redirect_chain"] = [
                     {"status": r.status_code, "url": str(r.url)} 
@@ -1128,11 +1146,9 @@ class SiteCrawler:
                 ]
             else:
                 record["redirect_chain"] = []
-            # ---------------------------------------------
             
             html = resp.text or ""
 
-            # Check if payload is non-HTML.
             is_html_header = (
                 "html"
                 in record[
@@ -1316,7 +1332,6 @@ class SiteCrawler:
             self.fetch_and_parse_robots()
         )
 
-        # Post-fetch deduplication state.
         pages_manifest = []
         seen_final_urls = set()
         seen_signatures = set()
@@ -1324,7 +1339,6 @@ class SiteCrawler:
         def ingest_records(
             records,
         ):
-            """Append records and flag identical normal pages as duplicates."""
             for rec in records:
                 if (
                     rec.get(
@@ -1366,7 +1380,6 @@ class SiteCrawler:
 
                 pages_manifest.append(rec)
 
-        # 1. Fetch homepage.
         homepage_record = self.fetch_page(
             self.target_url,
             0,
@@ -1376,7 +1389,6 @@ class SiteCrawler:
             [homepage_record]
         )
 
-        # --- Subdomain Pivot Logic ---
         pivot_diagnostics = None
 
         homepage_path = (
@@ -1414,7 +1426,6 @@ class SiteCrawler:
                     self.fetch_and_parse_robots()
                 )
 
-                # Re-fetch pivot target and reset deduplication state.
                 pages_manifest.clear()
                 seen_final_urls.clear()
                 seen_signatures.clear()
@@ -1435,7 +1446,6 @@ class SiteCrawler:
                 "subdomain_pivot"
             ] = pivot_diagnostics
 
-        # Handle top-level crawl failures.
         if (
             homepage_record[
                 "content_classification"
@@ -1498,12 +1508,16 @@ class SiteCrawler:
 
         candidates = []
 
-        # 1. SITEMAP FIRST.
+        # 1. AI MANIFEST (Highest Priority Override)
+        ai_manifest_urls = self._read_ai_manifest_urls()
+        candidates.extend(ai_manifest_urls)
+
+        # 2. SITEMAP
         candidates.extend(
             self._read_sitemap_urls()
         )
 
-        # 2. DOM SUPPLEMENT.
+        # 3. DOM SUPPLEMENT
         homepage_path = (
             PAGES_DIR / "page_0.html"
         )
@@ -1520,13 +1534,12 @@ class SiteCrawler:
                 )
             )
 
-        # 3. Build the FULL candidate URL inventory BEFORE sampling.
-        #
-        # This is discovery evidence only.
-        # It does not mean any of these URLs were fetched.
+        ai_seeds = set(ai_manifest_urls)
+        
         candidate_pool = (
             self.prioritized_urls(
-                candidates
+                candidates,
+                priority_seeds=ai_seeds
             )
         )
 
@@ -1536,7 +1549,6 @@ class SiteCrawler:
             )
         )
 
-        # The actual HTML crawl remains bounded.
         initial_target_count = max(
             0,
             self.max_pages - 1,
@@ -1566,7 +1578,6 @@ class SiteCrawler:
                 initial_records
             )
 
-        # Dynamic refill loop.
         MAX_EXTRA_FETCHES = 6
         extra_fetches_done = 0
 
@@ -1715,7 +1726,6 @@ class SiteCrawler:
                 "URLs returned bot-challenge content."
             )
 
-        # Store crawl metadata.
         meta.update(
             {
                 "pages_requested": len(
@@ -1736,8 +1746,6 @@ class SiteCrawler:
                 ),
                 "non_html_details": non_html_pages,
                 "pages_by_classification": counts,
-
-                # VERIFIED page types.
                 "page_type_counts": {
                     page_type: sum(
                         p.get("page_type")
@@ -1750,7 +1758,6 @@ class SiteCrawler:
                     }
                     if page_type
                 },
-
                 "usable_page_ratio": round(
                     len(usable_pages)
                     / max(
@@ -1759,7 +1766,6 @@ class SiteCrawler:
                     ),
                     3,
                 ),
-
                 "challenge_ratio": round(
                     len(challenge_pages)
                     / max(
@@ -1768,21 +1774,16 @@ class SiteCrawler:
                     ),
                     3,
                 ),
-
-                # DISCOVERED page types from the FULL
-                # candidate URL universe.
                 "candidate_url_counts": (
                     candidate_typology[
                         "counts"
                     ]
                 ),
-
                 "candidate_url_examples": (
                     candidate_typology[
                         "examples"
                     ]
                 ),
-
                 "candidate_url_total": (
                     candidate_typology[
                         "total"
@@ -1791,7 +1792,6 @@ class SiteCrawler:
             }
         )
 
-        # Filter manifest and clean filesystem.
         clean_manifest = []
 
         for page in pages_manifest:
@@ -1816,7 +1816,6 @@ class SiteCrawler:
                     except OSError:
                         pass
 
-        # Write only clean normal pages.
         index_payload = {
             "site": self.target_url,
             "domain_root": self.domain_root,

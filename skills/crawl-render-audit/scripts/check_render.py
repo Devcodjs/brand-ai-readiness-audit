@@ -290,7 +290,7 @@ def noindex_findings(pages: list) -> list:
         "title": "Pages Blocked From Indexing via noindex",
         "severity": severity,
         "evidence": (
-            f"CONFESSION: Site-level policy explicitly declares {reason}. "
+            f"Site-level policy explicitly declares {reason}. "
             f"Because this is declared directly in HTML meta tags or HTTP headers, "
             f"AI and search indexers honor this directive regardless of bot identity. "
             f"Examples: {', '.join(noindexed[:5])}."
@@ -554,7 +554,7 @@ def audit_crawl_and_render(
         severity = "critical" if is_total_block else "high"
         
         if is_total_block:
-            evidence_str = f"CONFESSION: robots.txt explicitly disallows ALL tracked AI search/retrieval agents ({', '.join(blocked_bots)}). This prevents live retrieval, meaning AI cannot fetch current facts directly from your site."
+            evidence_str = f"robots.txt explicitly disallows ALL tracked AI search/retrieval agents ({', '.join(blocked_bots)}). This prevents live retrieval, meaning AI cannot fetch current facts directly from your site."
             action_summary = (
                 "This block prevents future crawling but does not erase past training data. AI systems will still answer "
                 "questions about your brand using stale memory or third-party mentions, but you permanently lose the ability "
@@ -563,7 +563,7 @@ def audit_crawl_and_render(
                 "specific retrieval-bot disallows is required to restore live AI discoverability."
             )
         else:
-            evidence_str = f"CONFESSION: robots.txt explicitly disallows specific AI search/retrieval agents: {', '.join(blocked_bots)}."
+            evidence_str = f"robots.txt explicitly disallows specific AI search/retrieval agents: {', '.join(blocked_bots)}."
             action_summary = (
                 "Review robots.txt rules for AI/search crawlers. Ensure you are not accidentally blocking specific discovery engines "
                 "(like OAI-SearchBot or PerplexityBot) due to legacy security templates. Blocking these bots forces them to rely on "
